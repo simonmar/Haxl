@@ -4,6 +4,7 @@
 
 module Bench where
 
+import DataCacheTest
 import Haxl.Core.DataCache as DataCache
 import Haxl.Core.Types
 

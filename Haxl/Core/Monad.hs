@@ -16,6 +16,7 @@
 
 -}
 
+{-# OPTIONS_GHC -funbox-strict-fields #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE ExistentialQuantification #-}
@@ -102,17 +103,17 @@ newtype GenHaxl u a = GenHaxl
 -}
 
 data SchedState u = SchedState
-  { reqStoreRef :: IORef (RequestStore u)
+  { reqStoreRef :: !(IORef (RequestStore u))
        -- ^ The set of requests that we have not submitted to data sources yet.
        -- Owned by the scheduler.
-  , runQueue    :: IORef [GenHaxl u ()]
+  , runQueue    :: !(IORef [GenHaxl u ()])
        -- ^ Computations waiting to run.
        -- Owned by the scheduler.
-  , numRequests :: IORef Int
+  , numRequests :: !(IORef Int)
        -- ^ Number of requests that we have submitted to data sources but
        -- that have not yet completed.
        -- Owned by the scheduler.
-  , completions :: TVar [CompleteReq u]
+  , completions :: !(TVar [CompleteReq u])
        -- ^ Requests that have completed.
        -- Modified by data sources (via putResult) and the scheduler.
   }
@@ -125,7 +126,11 @@ type ContVar u a = IORef [a -> GenHaxl u ()] -- Owned by the scheduler
 
 -- | A synchronisation point.  It either contains the value, or a list
 -- of computations waiting for the value.
-newtype IVar u a = IVar (IORef (Either a (ContVar u a)))
+newtype IVar u a = IVar (IORef (IVarContents u a))
+
+data IVarContents u a
+  = IVarFull a
+  | IVarEmpty !(ContVar u a)
 
 -- | A completed request from a data source, containing the result,
 -- and the 'IVar' representing the blocked computations.  The job of a
@@ -143,7 +148,7 @@ data Result u a
   = Done a
   | Throw SomeException
   | forall b . Blocked
-      (ContVar u b)       -- ^ What we are blocked on
+      !(ContVar u b)      -- ^ What we are blocked on
       (b -> GenHaxl u a)  -- ^ The continuation.  This might be
                           -- wrapped further if we're nested inside
                           -- multiple '>>=', before finally being
@@ -181,15 +186,15 @@ instance Applicative (GenHaxl u) where
       Blocked cvar1 ff -> do
         ra <- a env ref  -- left is blocked, explore the right
         case ra of
-          Done a' ->
+          Done a' -> {-# SCC "b1" #-}
             return (Blocked cvar1 (\b -> do f <- ff b; return (f a')))
-          Throw e ->
+          Throw e -> {-# SCC "b2" #-}
             return (Blocked cvar1 (\b -> ff b <*> throw e))
-          Blocked cvar2 fa -> do        -- Note [Blocked/Blocked]
+          Blocked cvar2 fa -> {-# SCC "b3" #-} do        -- Note [Blocked/Blocked]
             i <- newIVar
-            modifyIORef cvar2 $ \cs -> (\b -> fa b >>= putIVar i) : cs
-            let cont r = do f <- ff r; a <- getIVar i; return (f a)
-            return (Blocked cvar1 cont)
+            {-# SCC "cvar1" #-} modifyIORef' cvar1 $ \cs -> (\b -> ff b >>= putIVar i) : cs
+            let cont r = do a <- fa r; f <- getIVar i; return (f a)
+            return (Blocked cvar2 cont)
 
 
 
@@ -208,33 +213,33 @@ instance Applicative (GenHaxl u) where
 --
 --   (do ff <- f; getIVar i; return (ff a)) <*> (a >>= putIVar i)
 --
--- where the IVar i is a new join point.  If the left side gets to the
--- `getIVar` first, it will block until the right side has called
--- 'putIVar'.
+-- where the IVar i is a new synchronisation point.  If the left side
+-- gets to the `getIVar` first, it will block until the right side has
+-- called 'putIVar'.
 
 
 getIVar :: IVar u a -> GenHaxl u a
 getIVar (IVar ref) = GenHaxl $ \_ _ -> do
   e <- readIORef ref
   case e of
-    Left a -> return (Done a)
-    Right cref -> return (Blocked cref return)
+    IVarFull a -> return (Done a)
+    IVarEmpty cref -> return (Blocked cref return)
 
 putIVar :: IVar u a -> a -> GenHaxl u ()
 putIVar (IVar ref) a = GenHaxl $ \_ SchedState{..} -> do
   e <- readIORef ref
   case e of
-    Left a -> error "putIVar: multiple put"
-    Right cref -> do
-      writeIORef ref (Left a)
+    IVarFull a -> error "putIVar: multiple put"
+    IVarEmpty cref -> do
+      writeIORef ref (IVarFull a)
       haxls <- readIORef cref
-      modifyIORef runQueue $ \hs -> map ($a) haxls ++ hs
+      modifyIORef' runQueue $ \hs -> map ($a) haxls ++ hs
       return (Done ())
 
 newIVar :: IO (IVar u a)
 newIVar = do
   cref <- newIORef []
-  ref <- newIORef (Right cref)
+  ref <- newIORef (IVarEmpty cref)
   return (IVar ref)
 
 
@@ -246,11 +251,11 @@ data SchedPolicy
 -- | Runs a 'Haxl' computation in an 'Env'.
 runHaxl :: forall u a. Env u -> GenHaxl u a -> IO a
 runHaxl env haxl = do
-  q <- newIORef []                      -- run queue
-  resultRef <- newIORef Nothing         -- where to put the result
-  rs <- newIORef noRequests
-  nr <- newIORef 0
-  comps <- newTVarIO []
+  q <- newIORef []                   -- run queue
+  resultRef <- newIORef Nothing      -- where to put the final result
+  rs <- newIORef noRequests          -- RequestStore
+  nr <- newIORef 0                   -- numRequests
+  comps <- newTVarIO []              -- completion queue
   let st = SchedState
              { reqStoreRef = rs
              , runQueue = q
@@ -269,7 +274,7 @@ runHaxl env haxl = do
       Done _ -> reschedule q
       Throw e -> throwIO e
       Blocked cref fn -> do
-        modifyIORef cref (fn:)
+        modifyIORef' cref (fn:)
         reschedule q
 
   reschedule :: SchedState u -> IO ()
@@ -319,7 +324,7 @@ runHaxl env haxl = do
         let getComplete (CompleteReq a (IVar cr)) = do
               r <- readIORef cr
               case r of
-                Left _ -> do
+                IVarFull _ -> do
 --                  printf "existing result\n"
                   return []
                   -- this happens if a data source reports a result,
@@ -328,8 +333,8 @@ runHaxl env haxl = do
                   -- ahead of the original request (because it is
                   -- pushed on the front of the completions list) and
                   -- therefore overrides it.
-                Right cv -> do
-                  writeIORef cr (Left a)
+                IVarEmpty cv -> do
+                  writeIORef cr (IVarFull a)
                   modifyIORef' numRequests (subtract 1)
                   map ($a) <$> readIORef cv
         jobs <- mapM getComplete comps
@@ -394,7 +399,7 @@ checkCache flags SchedState{..} ref req = do
   let
     do_fetch = do
       cvar <- newContVar
-      cr <- IVar <$> newIORef (Right cvar)
+      cr <- IVar <$> newIORef (IVarEmpty cvar)
       let done r = atomically $ do
             cs <- readTVar completions
             writeTVar completions (CompleteReq r cr : cs)
@@ -407,8 +412,8 @@ checkCache flags SchedState{..} ref req = do
     Just (IVar cr) -> do
       e <- readIORef cr
       case e of
-        Right cvar -> return (CachedNotFetched cvar)
-        Left r -> do
+        IVarEmpty cvar -> return (CachedNotFetched cvar)
+        IVarFull r -> do
           ifTrace flags 3 $ putStrLn $ case r of
             Left _ -> "Cached error: " ++ show req
             Right _ -> "Cached request: " ++ show req
@@ -512,7 +517,7 @@ dataFetch req = GenHaxl $ \env st@SchedState{..} -> do
 uncachedRequest :: (DataSource u r, Request r a) => r a -> GenHaxl u a
 uncachedRequest req = GenHaxl $ \_env SchedState{..} -> do
   cvar <- newContVar
-  cr <- IVar <$> newIORef (Right cvar)
+  cr <- IVar <$> newIORef (IVarEmpty cvar)
   let done r = atomically $ do
         cs <- readTVar completions
         writeTVar completions (CompleteReq r cr : cs)
@@ -555,8 +560,8 @@ cacheRequest request result = GenHaxl $ \env _st -> do
   cache <- readIORef (cacheRef env)
   case DataCache.lookup request cache of
     Nothing -> do
-      cr <- IVar <$> newIORef (Left result)
-      writeIORef (cacheRef env) (DataCache.insert request cr cache)
+      cr <- IVar <$> newIORef (IVarFull result)
+      writeIORef (cacheRef env) $! DataCache.insert request cr cache
       return (Done ())
 
     -- It is an error if the request is already in the cache.  We can't test

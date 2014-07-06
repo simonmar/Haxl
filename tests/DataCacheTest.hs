@@ -1,5 +1,5 @@
 {-# LANGUAGE StandaloneDeriving, GADTs, DeriveDataTypeable #-}
-module DataCacheTest (tests) where
+module DataCacheTest (tests, newResult, takeResult) where
 
 import Haxl.Core.DataCache as DataCache
 import Haxl.Core
