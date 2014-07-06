@@ -14,10 +14,7 @@
 
 -- | Generic fetching infrastructure, used by 'Haxl.Core.Monad'.
 module Haxl.Core.Fetch
-  ( CacheResult(..)
-  , cached
-  , memoized
-  , performFetches
+  ( performFetches
   ) where
 
 import Haxl.Core.DataCache as DataCache
@@ -28,6 +25,7 @@ import Haxl.Core.Show1
 import Haxl.Core.StateStore
 import Haxl.Core.Types
 import Haxl.Core.Util
+import {-# SOURCE #-} Haxl.Core.Monad
 
 import Control.Exception
 import Control.Monad
@@ -38,6 +36,7 @@ import Text.Printf
 import Data.Monoid
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.Text as Text
+import Data.Hashable
 
 -- | Issues a batch of fetches in a 'RequestStore'. After
 -- 'performFetches', all the requests in the 'RequestStore' are
@@ -100,73 +99,28 @@ wrapFetch reqs fetch =
   case fetch of
     SyncFetch io -> SyncFetch (io `catch` handler)
     AsyncFetch fio -> AsyncFetch (\io -> fio io `catch` handler)
+    FullyAsyncFetch io -> FullyAsyncFetch (io `catch` handler)
   where
     handler :: SomeException -> IO ()
     handler e = mapM_ (forceError e) reqs
 
     -- Set the exception even if the request already had a result.
     -- Otherwise we could be discarding an exception.
-    forceError e (BlockedFetch _ rvar) = do
-      void $ tryTakeResult rvar
+    forceError e (BlockedFetch _ rvar) =
       putResult rvar (except e)
 
 -- | Start all the async fetches first, then perform the sync fetches before
 -- getting the results of the async fetches.
-scheduleFetches :: [PerformFetch] -> IO()
-scheduleFetches fetches = async_fetches sync_fetches
+scheduleFetches :: [PerformFetch] -> IO ()
+scheduleFetches fetches = fully_async_fetches >> async_fetches sync_fetches
  where
+  fully_async_fetches :: IO ()
+  fully_async_fetches = sequence_ [f | FullyAsyncFetch f <- fetches]
+
   async_fetches :: IO () -> IO ()
   async_fetches = compose [f | AsyncFetch f <- fetches]
 
   sync_fetches :: IO ()
   sync_fetches = sequence_ [io | SyncFetch io <- fetches]
 
--- | Possible responses when checking the cache.
-data CacheResult a
-  -- | The request hadn't been seen until now.
-  = Uncached (ResultVar a)
 
-  -- | The request has been seen before, but its result has not yet been
-  -- fetched.
-  | CachedNotFetched (ResultVar a)
-
-  -- | The request has been seen before, and its result has already been
-  -- fetched.
-  | Cached (Either SomeException a)
-
-
--- | Checks the data cache for the result of a request.
-cached :: (Request r a) => Env u -> r a -> IO (CacheResult a)
-cached env = checkCache (flags env) (cacheRef env)
-
--- | Checks the memo cache for the result of a computation.
-memoized :: (Request r a) => Env u -> r a -> IO (CacheResult a)
-memoized env = checkCache (flags env) (memoRef env)
-
--- | Common guts of 'cached' and 'memoized'.
-checkCache
-  :: (Request r a)
-  => Flags
-  -> IORef DataCache
-  -> r a
-  -> IO (CacheResult a)
-
-checkCache flags ref req = do
-  cache <- readIORef ref
-  let
-    do_fetch = do
-      rvar <- newEmptyResult
-      writeIORef ref $! DataCache.insert req rvar cache
-      return (Uncached rvar)
-  case DataCache.lookup req cache of
-    Nothing -> do_fetch
-    Just rvar -> do
-      mb <- tryReadResult rvar
-      case mb of
-        Nothing -> return (CachedNotFetched rvar)
-        -- Use the cached result, even if it was an error.
-        Just r -> do
-          ifTrace flags 3 $ putStrLn $ case r of
-            Left _ -> "Cached error: " ++ show req
-            Right _ -> "Cached request: " ++ show req
-          return (Cached r)

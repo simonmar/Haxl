@@ -4,12 +4,14 @@ module DataCacheTest (tests) where
 import Haxl.Core.DataCache as DataCache
 import Haxl.Core
 
+import Control.Applicative
 import Control.Exception
 import Data.Hashable
 import Data.Traversable
 import Data.Typeable
 import Prelude hiding (mapM)
 import Test.HUnit
+import Data.IORef
 
 data TestReq a where
    Req :: Int -> TestReq a -- polymorphic result
@@ -21,6 +23,15 @@ deriving instance Show (TestReq a)
 instance Hashable (TestReq a) where
   hashWithSalt salt (Req i) = hashWithSalt salt i
 
+newResult :: a -> IO (IVar u (Either SomeException a))
+newResult a = IVar <$> newIORef (Left (Right a))
+
+takeResult :: IVar u (Either SomeException a) -> IO (Either SomeException a)
+takeResult (IVar ref) = do
+  e <- readIORef ref
+  case e of
+    Left a -> return a
+    _ -> error "takeResult"
 
 dcSoundnessTest :: Test
 dcSoundnessTest = TestLabel "DataCache soundness" $ TestCase $ do

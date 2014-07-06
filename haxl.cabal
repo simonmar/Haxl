@@ -36,6 +36,7 @@ library
     hashable == 1.2.*,
     pretty == 1.1.*,
     text == 1.1.*,
+    stm == 2.4.*,
     time == 1.4.*,
     unordered-containers == 0.2.*,
     vector == 0.10.*

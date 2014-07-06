@@ -25,8 +25,8 @@ import Data.IORef
 
 -- | The data we carry around in the Haxl monad.
 data Env u = Env
-  { cacheRef     :: IORef DataCache     -- cached data fetches
-  , memoRef      :: IORef DataCache     -- memoized computations
+  { cacheRef     :: IORef (DataCache u)     -- cached data fetches
+  , memoRef      :: IORef (DataCache u)     -- memoized computations
   , flags        :: Flags
   , userEnv      :: u
   , statsRef     :: IORef Stats
@@ -35,14 +35,14 @@ data Env u = Env
   -- here. Items in this store must be instances of 'StateKey'.
   }
 
-type Caches = (IORef DataCache, IORef DataCache)
+type Caches u = (IORef (DataCache u), IORef (DataCache u))
 
-caches :: Env u -> Caches
+caches :: Env u -> Caches u
 caches env = (cacheRef env, memoRef env)
 
 -- | Initialize an environment with a 'StateStore', an input map, a
 -- preexisting 'DataCache', and a seed for the random number generator.
-initEnvWithData :: StateStore -> u -> Caches -> IO (Env u)
+initEnvWithData :: StateStore -> u -> Caches u -> IO (Env u)
 initEnvWithData states e (cref, mref) = do
   sref <- newIORef emptyStats
   return Env

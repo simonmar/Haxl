@@ -44,13 +44,9 @@ module Haxl.Core.Types (
   -- * Result variables
   ResultVar(..),
   newEmptyResult,
-  newResult,
   putFailure,
   putResult,
   putSuccess,
-  takeResult,
-  tryReadResult,
-  tryTakeResult,
 
   -- * Default fetch implementations
   asyncFetch, asyncFetchWithDispatch,
@@ -67,9 +63,10 @@ import Control.Applicative
 import Control.Exception
 import Data.Typeable
 import Data.Text (Text)
-import Data.Aeson
+import Data.Aeson hiding (Result)
 import Data.Hashable
-import Control.Concurrent.MVar
+import Data.IORef
+import Control.Concurrent.STM
 import Control.Monad
 import qualified Data.HashMap.Strict as HashMap
 import Data.HashMap.Strict (HashMap)
@@ -107,13 +104,13 @@ ifTrace flags i m
 
 -- | Stats that we collect along the way.
 newtype Stats = Stats [RoundStats]
-  deriving ToJSON
+--  deriving ToJSON
 
 -- | Maps data source name to the number of requests made in that round.
 -- The map only contains entries for sources that made requests in that
 -- round.
 newtype RoundStats = RoundStats (HashMap Text Int)
-  deriving ToJSON
+--  deriving ToJSON
 
 fetchesInRound :: RoundStats -> Int
 fetchesInRound (RoundStats hm) = sum $ HashMap.elems hm
@@ -190,6 +187,7 @@ type Request req a =
 data PerformFetch
   = SyncFetch  (IO ())
   | AsyncFetch (IO () -> IO ())
+  | FullyAsyncFetch (IO ())
 
 -- Why does AsyncFetch contain a `IO () -> IO ()` rather than the
 -- alternative approach of returning the `IO` action to retrieve the
@@ -218,13 +216,6 @@ data PerformFetch
 --
 data BlockedFetch r = forall a. BlockedFetch (r a) (ResultVar a)
 
--- | Function for easily setting a fetch to a particular exception
-setError :: (Exception e) => (forall a. r a -> e) -> BlockedFetch r -> IO ()
-setError e (BlockedFetch req m) = putFailure m (e req)
-
-except :: (Exception e) => e -> Either SomeException a
-except = Left . toException
-
 -- | A sink for the result of a data fetch, used by 'BlockedFetch' and the
 -- 'DataCache'. Why do we need an 'MVar' here?  The reason is that the cache
 -- serves two purposes:
@@ -245,13 +236,10 @@ except = Left . toException
 --     from its 'MVar'. All instances of identical requests will share the same
 --     'MVar' to obtain the result.
 --
-newtype ResultVar a = ResultVar (MVar (Either SomeException a))
+newtype ResultVar a = ResultVar (Either SomeException a -> IO ())
 
-newResult :: a -> IO (ResultVar a)
-newResult x = ResultVar <$> newMVar (Right x)
-
-newEmptyResult :: IO (ResultVar a)
-newEmptyResult = ResultVar <$> newEmptyMVar
+newEmptyResult :: (Either SomeException a -> IO ()) -> IO (ResultVar a)
+newEmptyResult = return . ResultVar
 
 putFailure :: (Exception e) => ResultVar a -> e -> IO ()
 putFailure r = putResult r . except
@@ -260,16 +248,14 @@ putSuccess :: ResultVar a -> a -> IO ()
 putSuccess r = putResult r . Right
 
 putResult :: ResultVar a -> Either SomeException a -> IO ()
-putResult (ResultVar var) = putMVar var
+putResult (ResultVar io) res =  io res
 
-takeResult :: ResultVar a -> IO (Either SomeException a)
-takeResult (ResultVar var) = takeMVar var
+-- | Function for easily setting a fetch to a particular exception
+setError :: (Exception e) => (forall a. r a -> e) -> BlockedFetch r -> IO ()
+setError e (BlockedFetch req m) = putFailure m (e req)
 
-tryReadResult :: ResultVar a -> IO (Maybe (Either SomeException a))
-tryReadResult (ResultVar var) = tryReadMVar var
-
-tryTakeResult :: ResultVar a -> IO (Maybe (Either SomeException a))
-tryTakeResult (ResultVar var) = tryTakeMVar var
+except :: (Exception e) => e -> Either SomeException a
+except = Left . toException
 
 -- Fetch templates
 
@@ -369,3 +355,4 @@ submitFetch
   -> IO (IO ())
 submitFetch service fetch (BlockedFetch request result)
   = (putResult result =<<) <$> fetch service request
+

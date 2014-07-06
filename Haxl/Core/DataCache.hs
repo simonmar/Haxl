@@ -15,7 +15,7 @@ module Haxl.Core.DataCache
   , empty
   , insert
   , lookup
-  , showCache
+--  , showCache
   ) where
 
 import Data.HashMap.Strict (HashMap)
@@ -29,6 +29,7 @@ import Control.Applicative hiding (empty)
 import Control.Exception
 
 import Haxl.Core.Types
+import {-# SOURCE #-} Haxl.Core.Monad
 
 -- | The 'DataCache' maps things of type @f a@ to @'ResultVar' a@, for
 -- any @f@ and @a@ provided @f a@ is an instance of 'Typeable'. In
@@ -36,21 +37,21 @@ import Haxl.Core.Types
 --
 -- See the definition of 'ResultVar' for more details.
 
-newtype DataCache = DataCache (HashMap TypeRep SubCache)
+newtype DataCache u = DataCache (HashMap TypeRep (SubCache u))
 
 -- | The implementation is a two-level map: the outer level maps the
 -- types of requests to 'SubCache', which maps actual requests to their
 -- results.  So each 'SubCache' contains requests of the same type.
 -- This works well because we only have to store the dictionaries for
 -- 'Hashable' and 'Eq' once per request type.
-data SubCache =
+data SubCache u =
   forall req a . (Hashable (req a), Eq (req a), Show (req a), Show a) =>
-       SubCache ! (HashMap (req a) (ResultVar a))
+       SubCache ! (HashMap (req a) (IVar u (Either SomeException a)))
        -- NB. the inner HashMap is strict, to avoid building up
        -- a chain of thunks during repeated insertions.
 
 -- | A new, empty 'DataCache'.
-empty :: DataCache
+empty :: DataCache u
 empty = DataCache HashMap.empty
 
 -- | Inserts a request-result pair into the 'DataCache'.
@@ -58,10 +59,10 @@ insert
   :: (Hashable (r a), Typeable (r a), Eq (r a), Show (r a), Show a)
   => r a
   -- ^ Request
-  -> ResultVar a
+  -> IVar u (Either SomeException a)
   -- ^ Result
-  -> DataCache
-  -> DataCache
+  -> DataCache u
+  -> DataCache u
 
 insert req result (DataCache m) =
       DataCache $
@@ -76,8 +77,8 @@ lookup
   :: Typeable (r a)
   => r a
   -- ^ Request
-  -> DataCache
-  -> Maybe (ResultVar a)
+  -> DataCache u
+  -> Maybe (IVar u (Either SomeException a))
 
 lookup req (DataCache m) =
       case HashMap.lookup (typeOf req) m of
@@ -85,25 +86,26 @@ lookup req (DataCache m) =
         Just (SubCache sc) ->
            unsafeCoerce (HashMap.lookup (unsafeCoerce req) sc)
 
+{-
 -- | Dumps the contents of the cache, with requests and responses
 -- converted to 'String's using 'show'.  The entries are grouped by
 -- 'TypeRep'.
 --
 showCache
-  :: DataCache
+  :: DataCache u
   -> IO [(TypeRep, [(String, Either SomeException String)])]
 
 showCache (DataCache cache) = mapM goSubCache (HashMap.toList cache)
  where
   goSubCache
-    :: (TypeRep,SubCache)
+    :: (TypeRep,SubCache u)
     -> IO (TypeRep,[(String, Either SomeException String)])
   goSubCache (ty, SubCache hmap) = do
     elems <- catMaybes <$> mapM go (HashMap.toList hmap)
     return (ty, elems)
 
   go :: (Show (req a), Show a)
-     => (req a, ResultVar a)
+     => (req a, IVar u a)
      -> IO (Maybe (String, Either SomeException String))
   go (req, rvar) = do
     maybe_r <- tryReadResult rvar
@@ -111,3 +113,4 @@ showCache (DataCache cache) = mapM goSubCache (HashMap.toList cache)
       Nothing -> return Nothing
       Just (Left e) -> return (Just (show req, Left e))
       Just (Right result) -> return (Just (show req, Right (show result)))
+-}

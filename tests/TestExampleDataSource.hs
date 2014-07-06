@@ -26,13 +26,14 @@ testEnv = do
   initEnv st ()
 
 
-tests = TestList [
-  TestLabel "exampleTest" exampleTest,
-  TestLabel "orderTest" orderTest,
-  TestLabel "preCacheTest" preCacheTest,
-  TestLabel "cachedComputationTest" cachedComputationTest,
-  TestLabel "dataSourceExceptionTest" dataSourceExceptionTest,
-  TestLabel "dumpCacheAsHaskell" dumpCacheTest]
+tests = TestList
+  [ TestLabel "exampleTest" exampleTest
+  , TestLabel "orderTest" orderTest
+  , TestLabel "preCacheTest" preCacheTest
+  , TestLabel "cachedComputationTest" cachedComputationTest
+  , TestLabel "dataSourceExceptionTest" dataSourceExceptionTest
+--  TestLabel "dumpCacheAsHaskell" dumpCacheTest
+  ]
 
 -- Let's test ExampleDataSource.
 
@@ -132,6 +133,7 @@ dataSourceExceptionTest = TestCase $ do
       Left (ErrorCall "BANG2") -> True
       _ -> False
 
+{-
 -- Test that we can load the cache from a dumped copy of it, and then dump it
 -- again to get the same result.
 dumpCacheTest = TestCase $ do
@@ -140,3 +142,4 @@ dumpCacheTest = TestCase $ do
   str <- runHaxl env dumpCacheAsHaskell
   loadcache <- readFile "sigma/haxl/core/tests/LoadCache.txt"
   assertEqual "dumpCacheAsHaskell" str loadcache
+-}

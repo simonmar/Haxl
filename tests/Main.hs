@@ -5,6 +5,7 @@ import TestExampleDataSource
 import BatchTests
 import CoreTests
 import DataCacheTest
+import FullyAsyncTest
 
 import Data.String
 import Test.HUnit
@@ -17,4 +18,5 @@ main = runTestTT $ TestList
   , TestLabel "BatchTests" BatchTests.tests
   , TestLabel "CoreTests" CoreTests.tests
   , TestLabel "DataCacheTests" DataCacheTest.tests
+  , TestLabel "FullyAsyncTest" FullyAsyncTest.tests
   ]
