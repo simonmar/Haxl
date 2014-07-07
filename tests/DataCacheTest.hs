@@ -24,13 +24,13 @@ instance Hashable (TestReq a) where
   hashWithSalt salt (Req i) = hashWithSalt salt i
 
 newResult :: a -> IO (IVar u (Either SomeException a))
-newResult a = IVar <$> newIORef (Left (Right a))
+newResult a = IVar <$> newIORef (IVarFull (Right a))
 
 takeResult :: IVar u (Either SomeException a) -> IO (Either SomeException a)
 takeResult (IVar ref) = do
   e <- readIORef ref
   case e of
-    Left a -> return a
+    IVarFull a -> return a
     _ -> error "takeResult"
 
 dcSoundnessTest :: Test

@@ -15,6 +15,7 @@ module ExampleDataSource (
     ExampleReq(..),
     countAardvarks,
     listWombats,
+    Id(..)
   ) where
 
 import Haxl.Prelude
@@ -137,8 +138,8 @@ fetch1 (BlockedFetch (CountAardvarks "BANG2") m) = do
 fetch1 (BlockedFetch (CountAardvarks str) m) =
   putSuccess m (length (filter (== 'a') str))
 fetch1 (BlockedFetch (ListWombats a) r) =
-  if a > 99 then putFailure r $ FetchError "too large"
-            else putSuccess r $ take (fromIntegral a) [1..]
+  if a > 999999 then putFailure r $ FetchError "too large"
+                else putSuccess r $ take (fromIntegral a) [1..]
 
 
 -- Normally a data source will provide some convenient wrappers for

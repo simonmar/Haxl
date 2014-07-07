@@ -26,6 +26,7 @@
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE BangPatterns #-}
 
 -- | The implementation of the 'Haxl' monad.
 module Haxl.Core.Monad (
@@ -33,7 +34,7 @@ module Haxl.Core.Monad (
     GenHaxl (..), runHaxl,
     env,
 
-    IVar(..),
+    IVar(..), IVarContents(..),
 
     -- * Exceptions
     throw, catch, catchIf, try, tryToHaxlException,
@@ -92,16 +93,6 @@ import Control.Monad
 newtype GenHaxl u a = GenHaxl
   { unHaxl :: Env u -> SchedState u -> IO (Result u a) }
 
-{-
-- DataCache needs a TVar (Either a (ContVar a))
-  - so when we look up in dataFetch, we either have the result,
-    or we have a ContVar to block on.
-- BlockedFetch needs an (a -> IO ()) for completion
-  - IO action:
-    - fills in the TVar in the DataCache
-    - puts the ContVar on the completion queue
--}
-
 data SchedState u = SchedState
   { reqStoreRef :: !(IORef (RequestStore u))
        -- ^ The set of requests that we have not submitted to data sources yet.
@@ -122,7 +113,7 @@ data SchedState u = SchedState
 -- block on a resource, a 'ContVar' is created to track the blocked
 -- computations.  If another computation becomes blocked on the same
 -- resource, it will be added to the list in this 'IORef'.
-type ContVar u a = IORef [a -> GenHaxl u ()] -- Owned by the scheduler
+type ContVar u a = IORef [GenHaxl u ()] -- Owned by the scheduler
 
 -- | A synchronisation point.  It either contains the value, or a list
 -- of computations waiting for the value.
@@ -149,7 +140,7 @@ data Result u a
   | Throw SomeException
   | forall b . Blocked
       !(ContVar u b)      -- ^ What we are blocked on
-      (b -> GenHaxl u a)  -- ^ The continuation.  This might be
+      (GenHaxl u a)  -- ^ The continuation.  This might be
                           -- wrapped further if we're nested inside
                           -- multiple '>>=', before finally being
                           -- added to the 'ContVar'.
@@ -166,10 +157,16 @@ instance Monad (GenHaxl u) where
     case e of
       Done a       -> unHaxl (k a) env ref
       Throw e      -> return (Throw e)
-      Blocked cont f -> return (Blocked cont (\b -> f b >>= k))
+      Blocked cont f -> return (Blocked cont (f >>= k))
 
 instance Functor (GenHaxl u) where
-  fmap f m = pure f <*> m
+  fmap f (GenHaxl m) = GenHaxl $ \env ref -> do
+    r <- m env ref
+    case r of
+     Done a -> return (Done (f a))
+     Throw e -> return (Throw e)
+     Blocked cvar cont ->
+       return (Blocked cvar (do a <- cont; return (f a)))
 
 instance Applicative (GenHaxl u) where
   pure = return
@@ -182,18 +179,18 @@ instance Applicative (GenHaxl u) where
         case ra of
           Done a'    -> return (Done (f' a'))
           Throw e    -> return (Throw e)
-          Blocked cont fa -> return (Blocked cont (\b -> f' <$> (fa b)))
+          Blocked cont fa -> return (Blocked cont (f' <$> fa))
       Blocked cvar1 ff -> do
         ra <- a env ref  -- left is blocked, explore the right
         case ra of
-          Done a' -> {-# SCC "b1" #-}
-            return (Blocked cvar1 (\b -> do f <- ff b; return (f a')))
-          Throw e -> {-# SCC "b2" #-}
-            return (Blocked cvar1 (\b -> ff b <*> throw e))
-          Blocked cvar2 fa -> {-# SCC "b3" #-} do        -- Note [Blocked/Blocked]
+          Done a' ->
+            return (Blocked cvar1 (do f <- ff; return (f a')))
+          Throw e ->
+            return (Blocked cvar1 (ff <*> throw e))
+          Blocked cvar2 fa -> do        -- Note [Blocked/Blocked]
             i <- newIVar
-            {-# SCC "cvar1" #-} modifyIORef' cvar1 $ \cs -> (\b -> ff b >>= putIVar i) : cs
-            let cont r = do a <- fa r; f <- getIVar i; return (f a)
+            modifyIORef' cvar1 $ \cs -> (ff >>= putIVar i) : cs
+            let cont =  do a <- fa; f <- getIVar i; return (f a)
             return (Blocked cvar2 cont)
 
 
@@ -219,21 +216,21 @@ instance Applicative (GenHaxl u) where
 
 
 getIVar :: IVar u a -> GenHaxl u a
-getIVar (IVar ref) = GenHaxl $ \_ _ -> do
+getIVar (IVar !ref) = GenHaxl $ \_ _ -> do
   e <- readIORef ref
   case e of
     IVarFull a -> return (Done a)
-    IVarEmpty cref -> return (Blocked cref return)
+    IVarEmpty cref -> return (Blocked cref (getIVar (IVar ref)))
 
 putIVar :: IVar u a -> a -> GenHaxl u ()
-putIVar (IVar ref) a = GenHaxl $ \_ SchedState{..} -> do
+putIVar (IVar !ref) a = GenHaxl $ \_ SchedState{..} -> do
   e <- readIORef ref
   case e of
     IVarFull a -> error "putIVar: multiple put"
     IVarEmpty cref -> do
       writeIORef ref (IVarFull a)
       haxls <- readIORef cref
-      modifyIORef' runQueue $ \hs -> map ($a) haxls ++ hs
+      modifyIORef' runQueue (haxls ++)
       return (Done ())
 
 newIVar :: IO (IVar u a)
@@ -336,7 +333,7 @@ runHaxl env haxl = do
                 IVarEmpty cv -> do
                   writeIORef cr (IVarFull a)
                   modifyIORef' numRequests (subtract 1)
-                  map ($a) <$> readIORef cv
+                  readIORef cv
         jobs <- mapM getComplete comps
         modifyIORef' runQueue (concat jobs ++)
         return True
@@ -364,11 +361,11 @@ env f = GenHaxl $ \env _ref -> return (Done (f env))
 -- | Possible responses when checking the cache.
 data CacheResult u a
   -- | The request hadn't been seen until now.
-  = Uncached (ResultVar a) (ContVar u (Either SomeException a))
+  = Uncached (ResultVar a) !(ContVar u (Either SomeException a)) !(IVar u (Either SomeException a))
 
   -- | The request has been seen before, but its result has not yet been
   -- fetched.
-  | CachedNotFetched (ContVar u (Either SomeException a))
+  | CachedNotFetched !(ContVar u (Either SomeException a)) !(IVar u (Either SomeException a))
 
   -- | The request has been seen before, and its result has already been
   -- fetched.
@@ -406,13 +403,13 @@ checkCache flags SchedState{..} ref req = do
       rvar <- newEmptyResult done
       writeIORef ref $! DataCache.insert req cr cache
       modifyIORef' numRequests (+1)
-      return (Uncached rvar cvar)
+      return (Uncached rvar cvar cr)
   case DataCache.lookup req cache of
     Nothing -> do_fetch
     Just (IVar cr) -> do
       e <- readIORef cr
       case e of
-        IVarEmpty cvar -> return (CachedNotFetched cvar)
+        IVarEmpty cvar -> return (CachedNotFetched cvar (IVar cr))
         IVarFull r -> do
           ifTrace flags 3 $ putStrLn $ case r of
             Left _ -> "Cached error: " ++ show req
@@ -440,7 +437,7 @@ catch (GenHaxl m) h = GenHaxl $ \env ref -> do
      Done a    -> return (Done a)
      Throw e | Just e' <- fromException e -> unHaxl (h e') env ref
              | otherwise -> return (Throw e)
-     Blocked cont k -> return (Blocked cont (\b -> catch (k b) h))
+     Blocked cont k -> return (Blocked cont (catch k h))
 
 -- | Catch exceptions that satisfy a predicate
 catchIf
@@ -470,7 +467,7 @@ unsafeToHaxlException :: GenHaxl u a -> GenHaxl u a
 unsafeToHaxlException (GenHaxl m) = GenHaxl $ \env ref -> do
   r <- m env ref `Control.Exception.catch` \e -> return (Throw e)
   case r of
-    Blocked cont c -> return (Blocked cont (\b -> unsafeToHaxlException (c b)))
+    Blocked cont c -> return (Blocked cont (unsafeToHaxlException c))
     other -> return other
 
 -- | Like 'try', but lifts all exceptions into the 'HaxlException'
@@ -491,13 +488,13 @@ dataFetch req = GenHaxl $ \env st@SchedState{..} -> do
   case res of
     -- Not seen before: add the request to the RequestStore, so it
     -- will be fetched in the next round.
-    Uncached rvar cvar -> do
+    Uncached rvar cvar ivar -> do
       modifyIORef' reqStoreRef $ \bs -> addRequest (BlockedFetch req rvar) bs
-      return $ Blocked cvar doneH
+      return $ Blocked cvar (getIVar ivar >>= doneH)
 
     -- Seen before but not fetched yet.  We're blocked, but we don't have
     -- to add the request to the RequestStore.
-    CachedNotFetched cvar -> return $ Blocked cvar doneH
+    CachedNotFetched cvar ivar -> return $ Blocked cvar (getIVar ivar >>= doneH)
 
     -- Cached: either a result, or an exception
     Cached r -> done r
@@ -523,7 +520,7 @@ uncachedRequest req = GenHaxl $ \_env SchedState{..} -> do
         writeTVar completions (CompleteReq r cr : cs)
   rvar <- newEmptyResult done
   modifyIORef' numRequests (+1)
-  return $ Blocked cvar doneH
+  return $ Blocked cvar (getIVar cr >>= doneH)
 
 -- | Transparently provides caching. Useful for datasources that can
 -- return immediately, but also caches values.
@@ -531,12 +528,12 @@ cacheResult :: (Request r a)  => r a -> IO a -> GenHaxl u a
 cacheResult req val = GenHaxl $ \env st -> do
   cachedResult <- cached env st req
   case cachedResult of
-    Uncached rvar cvar -> do
+    Uncached rvar cvar _ivar -> do
       result <- Control.Exception.try val
       putResult rvar result
       done result
     Cached result -> done result
-    CachedNotFetched _ -> corruptCache
+    CachedNotFetched _ _ -> corruptCache
   where
     corruptCache = raise . DataSourceError $ Text.concat
       [ textShow req
@@ -586,7 +583,7 @@ cachedComputation req haxl = GenHaxl $ \env ref -> do
   res <- memoized env ref req
   case res of
     -- Uncached: we must compute the result and store it in the ResultVar.
-    Uncached rvar cvar -> do
+    Uncached rvar cvar _ivar -> do
       let
           with_result :: Either SomeException a -> GenHaxl u a
           with_result r = GenHaxl $ \_ _ -> do putResult rvar r; done r
@@ -597,7 +594,7 @@ cachedComputation req haxl = GenHaxl $ \env ref -> do
     -- have to block until the result is available.  Note that we might
     -- have to block repeatedly, because the Haxl computation might block
     -- multiple times before it has a result.
-    CachedNotFetched cvar -> return $ Blocked cvar doneH
+    CachedNotFetched cvar ivar -> return $ Blocked cvar (getIVar ivar >>= doneH)
     Cached r -> done r
 
 -- | Lifts an 'Either' into either 'Throw' or 'Done'.

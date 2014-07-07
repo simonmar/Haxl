@@ -91,8 +91,8 @@ preCacheTest = TestCase $ do
 
   x <- runHaxl env $ do
     cacheRequest (CountAardvarks "xxx") (Right 3)
-    cacheRequest (ListWombats 100) (Right [1,2,3])
-    countAardvarks "xxx" + (length <$> listWombats 100)
+    cacheRequest (ListWombats 1000000) (Right [1,2,3])
+    countAardvarks "xxx" + (length <$> listWombats 1000000)
   assertEqual "preCacheTest1" x (3 + 3)
 
   y <- Control.Exception.try $ runHaxl env $ do

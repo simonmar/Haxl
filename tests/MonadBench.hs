@@ -24,7 +24,14 @@ main = do
   env <- testEnv
   t0 <- getCurrentTime
   case test of
-    "par" -> runHaxl env $ Haxl.sequence_ (replicate n (listWombats 3))
+    "par1" -> runHaxl env $ Haxl.sequence_ (replicate n (listWombats 3))
+    "par2" -> runHaxl env $ Haxl.sequence_ (map listWombats [1..fromIntegral n])
     "seq" -> runHaxl env $ replicateM_ n (listWombats 3)
+    "tree" -> runHaxl env $ tree n >> return ()
   t1 <- getCurrentTime
   printf "%d reqs: %.2fs\n" n (realToFrac (t1 `diffUTCTime` t0) :: Double)
+
+tree :: Int -> GenHaxl () [Id]
+tree 0 = listWombats 0
+tree n = concat <$> Haxl.sequence [tree (n-1), listWombats (fromIntegral n), tree (n-1)]
+
