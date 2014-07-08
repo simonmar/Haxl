@@ -9,10 +9,9 @@
 
 - even with submit/wait async data sources, we could do some computation
   as soon as we have results, possibly getting more concurrency
-- try out the build system with this
 - write different scheduling policies
 - write benchmarks to compare this with Haxl 1.0
-- implement cachedComputation etc.
+- implement dumpCacheAsHaskell
 
 -}
 
@@ -114,6 +113,10 @@ data SchedState u = SchedState
 -- computations.  If another computation becomes blocked on the same
 -- resource, it will be added to the list in this 'IORef'.
 type ContVar u a = IORef [GenHaxl u ()] -- Owned by the scheduler
+  -- morally this list contains @a -> GenHaxl u ()@, but instead of
+  -- using a function, each computation begins with `getIVar` to grab
+  -- the value it is waiting for.  This is less type safe but a little
+  -- faster (benchmarked with tests/MonadBench.hs).
 
 -- | A synchronisation point.  It either contains the value, or a list
 -- of computations waiting for the value.
@@ -140,10 +143,11 @@ data Result u a
   | Throw SomeException
   | forall b . Blocked
       !(ContVar u b)      -- ^ What we are blocked on
-      (GenHaxl u a)  -- ^ The continuation.  This might be
-                          -- wrapped further if we're nested inside
-                          -- multiple '>>=', before finally being
-                          -- added to the 'ContVar'.
+      (GenHaxl u a)
+         -- ^ The continuation.  This might be wrapped further if
+         -- we're nested inside multiple '>>=', before finally being
+         -- added to the 'ContVar'.  Morally @b -> GenHaxl u a@, but see
+         -- 'ContVar',
 
 instance (Show a) => Show (Result u a) where
   show (Done a) = printf "Done(%s)" $ show a
@@ -165,32 +169,29 @@ instance Functor (GenHaxl u) where
     case r of
      Done a -> return (Done (f a))
      Throw e -> return (Throw e)
-     Blocked cvar cont ->
-       return (Blocked cvar (do a <- cont; return (f a)))
+     Blocked cvar cont -> return (Blocked cvar (fmap f cont))
 
 instance Applicative (GenHaxl u) where
   pure = return
-  GenHaxl f <*> GenHaxl a = GenHaxl $ \env ref -> do
-    r <- f env ref
-    case r of
+  GenHaxl ff <*> GenHaxl aa = GenHaxl $ \env ref -> do
+    rf <- ff env ref
+    case rf of
       Throw e -> return (Throw e)
-      Done f' -> do
-        ra <- a env ref
+      Done f -> do
+        ra <- aa env ref
         case ra of
-          Done a'    -> return (Done (f' a'))
-          Throw e    -> return (Throw e)
-          Blocked cont fa -> return (Blocked cont (f' <$> fa))
-      Blocked cvar1 ff -> do
-        ra <- a env ref  -- left is blocked, explore the right
+          Done a -> return (Done (f a))
+          Throw e -> return (Throw e)
+          Blocked cvar fcont -> return (Blocked cvar (f <$> fcont))
+      Blocked cvar1 fcont -> do
+        ra <- aa env ref  -- left is blocked, explore the right
         case ra of
-          Done a' ->
-            return (Blocked cvar1 (do f <- ff; return (f a')))
-          Throw e ->
-            return (Blocked cvar1 (ff <*> throw e))
-          Blocked cvar2 fa -> do        -- Note [Blocked/Blocked]
+          Done a -> return (Blocked cvar1 (do f <- fcont; return (f a)))
+          Throw e -> return (Blocked cvar1 (fcont <*> throw e))
+          Blocked cvar2 acont -> do        -- Note [Blocked/Blocked]
             i <- newIVar
-            modifyIORef' cvar1 $ \cs -> (ff >>= putIVar i) : cs
-            let cont =  do a <- fa; f <- getIVar i; return (f a)
+            modifyIORef' cvar1 $ \cs -> (fcont >>= putIVar i) : cs
+            let cont =  do a <- acont; f <- getIVar i; return (f a)
             return (Blocked cvar2 cont)
 
 
@@ -204,15 +205,21 @@ instance Applicative (GenHaxl u) where
 -- available.  Moreover, the computation as a whole depends on the two
 -- pieces.  It works like this:
 --
---   f <*> a
+--   ff <*> aa
 --
 -- becomes
 --
---   (do ff <- f; getIVar i; return (ff a)) <*> (a >>= putIVar i)
+--   (ff >>= putIVar i) <*> (a <- aa; f <- getIVar i; return (f a)
 --
 -- where the IVar i is a new synchronisation point.  If the left side
 -- gets to the `getIVar` first, it will block until the right side has
 -- called 'putIVar'.
+--
+-- We can also do it the other way around:
+--
+--   (do ff <- f; getIVar i; return (ff a)) <*> (a >>= putIVar i)
+--
+-- The first was slightly faster according to tests/MonadBench.hs.
 
 
 getIVar :: IVar u a -> GenHaxl u a
@@ -361,11 +368,16 @@ env f = GenHaxl $ \env _ref -> return (Done (f env))
 -- | Possible responses when checking the cache.
 data CacheResult u a
   -- | The request hadn't been seen until now.
-  = Uncached (ResultVar a) !(ContVar u (Either SomeException a)) !(IVar u (Either SomeException a))
+  = Uncached
+       (ResultVar a)
+       !(ContVar u (Either SomeException a))
+       !(IVar u (Either SomeException a))
 
   -- | The request has been seen before, but its result has not yet been
   -- fetched.
-  | CachedNotFetched !(ContVar u (Either SomeException a)) !(IVar u (Either SomeException a))
+  | CachedNotFetched
+      !(ContVar u (Either SomeException a))
+      !(IVar u (Either SomeException a))
 
   -- | The request has been seen before, and its result has already been
   -- fetched.
