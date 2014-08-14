@@ -15,7 +15,8 @@ import Haxl.Prelude
 main :: IO Counts
 main = runTestTT $ TestList
   [ TestLabel "ExampleDataSource" TestExampleDataSource.tests
-  , TestLabel "BatchTests" BatchTests.tests
+  , TestLabel "BatchTests" $ BatchTests.tests True
+  , TestLabel "BatchTests" $ BatchTests.tests False
   , TestLabel "CoreTests" CoreTests.tests
   , TestLabel "DataCacheTests" DataCacheTest.tests
   , TestLabel "FullyAsyncTest" FullyAsyncTest.tests

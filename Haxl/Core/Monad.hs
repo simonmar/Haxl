@@ -7,8 +7,6 @@
 
 {- TODO
 
-- even with submit/wait async data sources, we could do some computation
-  as soon as we have results, possibly getting more concurrency
 - write different scheduling policies
 - write benchmarks to compare this with Haxl 1.0
 - implement dumpCacheAsHaskell
@@ -39,12 +37,12 @@ module Haxl.Core.Monad (
     throw, catch, catchIf, try, tryToHaxlException,
 
     -- * Data fetching and caching
-    dataFetch, {- uncachedRequest, -}
-    cacheRequest, {- cacheResult, -} cachedComputation,
+    dataFetch, uncachedRequest,
+    cacheRequest, cacheResult, cachedComputation,
     {- dumpCacheAsHaskell, -}
 
     -- * Unsafe operations
-    unsafeLiftIO, unsafeToHaxlException,
+    unsafeLiftIO,
   ) where
 
 import Haxl.Core.Types
@@ -55,7 +53,6 @@ import Haxl.Core.RequestStore as RequestStore
 import Haxl.Core.Util
 import Haxl.Core.DataCache as DataCache
 
-import Data.Maybe
 import qualified Data.Text as Text
 import Control.Exception (Exception(..), SomeException, throwIO)
 import qualified Control.Exception
@@ -65,9 +62,7 @@ import GHC.Exts (IsString(..))
 import Prelude hiding (catch)
 #endif
 import Data.IORef
-import Data.Monoid
 import Text.Printf
-import Text.PrettyPrint hiding ((<>))
 import Control.Arrow (left)
 import Control.Concurrent.STM
 import Control.Monad
@@ -106,6 +101,7 @@ data SchedState u = SchedState
   , completions :: !(TVar [CompleteReq u])
        -- ^ Requests that have completed.
        -- Modified by data sources (via putResult) and the scheduler.
+  , pendingWaits :: [IO ()]
   }
 
 -- | A list of 'GenHaxl' computations waiting for a value.  When we
@@ -140,7 +136,6 @@ data CompleteReq u =
 -- a continuation.
 data Result u a
   = Done a
-  | Throw SomeException
   | forall b . Blocked
       !(ContVar u b)      -- ^ What we are blocked on
       (GenHaxl u a)
@@ -151,7 +146,6 @@ data Result u a
 
 instance (Show a) => Show (Result u a) where
   show (Done a) = printf "Done(%s)" $ show a
-  show (Throw e) = printf "Throw(%s)" $ show e
   show Blocked{} = "Blocked"
 
 instance Monad (GenHaxl u) where
@@ -160,7 +154,6 @@ instance Monad (GenHaxl u) where
     e <- m env ref
     case e of
       Done a       -> unHaxl (k a) env ref
-      Throw e      -> return (Throw e)
       Blocked cont f -> return (Blocked cont (f >>= k))
 
 instance Functor (GenHaxl u) where
@@ -168,7 +161,6 @@ instance Functor (GenHaxl u) where
     r <- m env ref
     case r of
      Done a -> return (Done (f a))
-     Throw e -> return (Throw e)
      Blocked cvar cont -> return (Blocked cvar (fmap f cont))
 
 instance Applicative (GenHaxl u) where
@@ -176,23 +168,22 @@ instance Applicative (GenHaxl u) where
   GenHaxl ff <*> GenHaxl aa = GenHaxl $ \env ref -> do
     rf <- ff env ref
     case rf of
-      Throw e -> return (Throw e)
       Done f -> do
         ra <- aa env ref
         case ra of
           Done a -> return (Done (f a))
-          Throw e -> return (Throw e)
           Blocked cvar fcont -> return (Blocked cvar (f <$> fcont))
       Blocked cvar1 fcont -> do
-        ra <- aa env ref  -- left is blocked, explore the right
-        case ra of
-          Done a -> return (Blocked cvar1 (do f <- fcont; return (f a)))
-          Throw e -> return (Blocked cvar1 (fcont <*> throw e))
-          Blocked cvar2 acont -> do        -- Note [Blocked/Blocked]
-            i <- newIVar
-            modifyIORef' cvar1 $ \cs -> (fcont >>= putIVar i) : cs
-            let cont =  do a <- acont; f <- getIVar i; return (f a)
-            return (Blocked cvar2 cont)
+        e <- Control.Exception.try $ aa env ref
+        case e of
+          Left e -> return (Blocked cvar1 (fcont <*> throw (e::SomeException)))
+          Right ra -> case ra of
+            Done a -> return (Blocked cvar1 (do f <- fcont; return (f a)))
+            Blocked cvar2 acont -> do        -- Note [Blocked/Blocked]
+              i <- newIVar
+              modifyIORef' cvar1 $ \cs -> (fcont >>= putIVar i) : cs
+              let cont =  do a <- acont; f <- getIVar i; return (f a)
+              return (Blocked cvar2 cont)
 
 
 
@@ -233,7 +224,7 @@ putIVar :: IVar u a -> a -> GenHaxl u ()
 putIVar (IVar !ref) a = GenHaxl $ \_ SchedState{..} -> do
   e <- readIORef ref
   case e of
-    IVarFull a -> error "putIVar: multiple put"
+    IVarFull _ -> error "putIVar: multiple put"
     IVarEmpty cref -> do
       writeIORef ref (IVarFull a)
       haxls <- readIORef cref
@@ -264,7 +255,8 @@ runHaxl env haxl = do
              { reqStoreRef = rs
              , runQueue = q
              , numRequests = nr
-             , completions = comps }
+             , completions = comps
+             , pendingWaits = [] }
   schedule st (haxl >>= unsafeLiftIO . writeIORef resultRef . Just)
   r <- readIORef resultRef
   case r of
@@ -276,7 +268,6 @@ runHaxl env haxl = do
     r <- run env q
     case r of
       Done _ -> reschedule q
-      Throw e -> throwIO e
       Blocked cref fn -> do
         modifyIORef' cref (fn:)
         reschedule q
@@ -306,13 +297,23 @@ runHaxl env haxl = do
     if any_done
       then reschedule q
       else do
-        reqStore <- readIORef reqStoreRef
-        if RequestStore.isEmpty reqStore
-          then waitCompletions q
-          else do
-            writeIORef reqStoreRef noRequests
-            performFetches env reqStore -- latency optimised
-            emptyRunQueue q
+        case pendingWaits of
+          [] -> checkRequestStore q
+          wait:waits -> do
+--            printf "invoking wait\n"
+            wait
+            emptyRunQueue q { pendingWaits = waits } -- check completions
+
+  checkRequestStore :: SchedState u -> IO ()
+  checkRequestStore q@SchedState{..} = do
+    reqStore <- readIORef reqStoreRef
+    if RequestStore.isEmpty reqStore
+      then waitCompletions q
+      else do
+        writeIORef reqStoreRef noRequests
+        waits <- performFetches env reqStore -- latency optimised
+--        printf "performFetches: %d waits\n" (length waits)
+        emptyRunQueue q{ pendingWaits = waits ++ pendingWaits }
 
   checkCompletions :: SchedState u -> IO Bool
   checkCompletions q@SchedState{..} = do
@@ -436,20 +437,17 @@ newContVar = newIORef []
 
 -- | Throw an exception in the Haxl monad
 throw :: (Exception e) => e -> GenHaxl u a
-throw e = GenHaxl $ \_env _ref -> raise e
-
-raise :: (Exception e) => e -> IO (Result u a)
-raise = return . Throw . toException
+throw e = GenHaxl $ \_env _ref -> throwIO e
 
 -- | Catch an exception in the Haxl monad
 catch :: Exception e => GenHaxl u a -> (e -> GenHaxl u a) -> GenHaxl u a
 catch (GenHaxl m) h = GenHaxl $ \env ref -> do
-   r <- m env ref
-   case r of
-     Done a    -> return (Done a)
-     Throw e | Just e' <- fromException e -> unHaxl (h e') env ref
-             | otherwise -> return (Throw e)
-     Blocked cont k -> return (Blocked cont (catch k h))
+   e <- Control.Exception.try $ m env ref
+   case e of
+     Left e | Just e' <- fromException e -> unHaxl (h e') env ref
+     Left e -> throwIO e
+     Right (Done a) -> return (Done a)
+     Right (Blocked cvar k) -> return (Blocked cvar (catch k h))
 
 -- | Catch exceptions that satisfy a predicate
 catchIf
@@ -471,23 +469,12 @@ try haxl = (Right <$> haxl) `catch` (return . Left)
 unsafeLiftIO :: IO a -> GenHaxl u a
 unsafeLiftIO m = GenHaxl $ \_env _ref -> Done <$> m
 
--- | Convert exceptions in the underlying IO monad to exceptions in
--- the Haxl monad.  This is morally unsafe, because you could then
--- catch those exceptions in Haxl and observe the underlying execution
--- order.  Not to be exposed to user code.
-unsafeToHaxlException :: GenHaxl u a -> GenHaxl u a
-unsafeToHaxlException (GenHaxl m) = GenHaxl $ \env ref -> do
-  r <- m env ref `Control.Exception.catch` \e -> return (Throw e)
-  case r of
-    Blocked cont c -> return (Blocked cont (unsafeToHaxlException c))
-    other -> return other
-
 -- | Like 'try', but lifts all exceptions into the 'HaxlException'
 -- hierarchy.  Uses 'unsafeToHaxlException' internally.  Typically
 -- this is used at the top level of a Haxl computation, to ensure that
 -- all exceptions are caught.
 tryToHaxlException :: GenHaxl u a -> GenHaxl u (Either HaxlException a)
-tryToHaxlException h = left asHaxlException <$> try (unsafeToHaxlException h)
+tryToHaxlException h = left asHaxlException <$> try h
 
 -- -----------------------------------------------------------------------------
 -- Data fetching and caching
@@ -547,7 +534,7 @@ cacheResult req val = GenHaxl $ \env st -> do
     Cached result -> done result
     CachedNotFetched _ _ -> corruptCache
   where
-    corruptCache = raise . DataSourceError $ Text.concat
+    corruptCache = throwIO . DataSourceError $ Text.concat
       [ textShow req
       , " has a corrupted cache value: these requests are meant to"
       , " return immediately without an intermediate value. Either"
@@ -576,7 +563,7 @@ cacheRequest request result = GenHaxl $ \env _st -> do
     -- It is an error if the request is already in the cache.  We can't test
     -- whether the cached result is the same without adding an Eq constraint,
     -- and we don't necessarily have Eq for all results.
-    _other -> raise $
+    _other -> throwIO $
       DataSourceError "cacheRequest: request is already in the cache"
 
 instance IsString a => IsString (GenHaxl u a) where
@@ -611,7 +598,8 @@ cachedComputation req haxl = GenHaxl $ \env ref -> do
 
 -- | Lifts an 'Either' into either 'Throw' or 'Done'.
 done :: Either SomeException a -> IO (Result u a)
-done = return . either Throw Done
+done (Left e) = throwIO e
+done (Right a) = return (Done a)
 
 -- | Lifts an 'Either' into either 'Throw' or 'Done'.
 doneH :: Either SomeException a -> GenHaxl u a

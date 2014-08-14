@@ -186,8 +186,16 @@ type Request req a =
 --
 data PerformFetch
   = SyncFetch  (IO ())
+    -- ^ Fully synchronous, returns only when all the data is fetched.
   | AsyncFetch (IO () -> IO ())
+    -- ^ Asynchronous; performs an arbitrary IO action while the data is
+    -- being fetched, but only returns when all the data is fetched.
+  | FutureFetch (IO (IO ()))
+    -- ^ Returns an IO action that, when performed, waits for the data
+    -- to be received.
   | FullyAsyncFetch (IO ())
+    -- ^ Fetches the data in the background, calling 'putResult' at
+    -- any time in the future.
 
 -- Why does AsyncFetch contain a `IO () -> IO ()` rather than the
 -- alternative approach of returning the `IO` action to retrieve the

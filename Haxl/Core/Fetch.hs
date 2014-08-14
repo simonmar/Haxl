@@ -41,7 +41,7 @@ import Data.Hashable
 -- | Issues a batch of fetches in a 'RequestStore'. After
 -- 'performFetches', all the requests in the 'RequestStore' are
 -- complete, and all of the 'ResultVar's are full.
-performFetches :: forall u. Env u -> RequestStore u -> IO ()
+performFetches :: forall u. Env u -> RequestStore u -> IO [IO ()]
 performFetches env reqs = do
   let f = flags env
       sref = statsRef env
@@ -82,12 +82,14 @@ performFetches env reqs = do
 
   fetches <- mapM applyFetch jobs
 
-  scheduleFetches fetches
+  waits <- scheduleFetches fetches
 
   ifTrace f 1 $ do
     t1 <- getCurrentTime
     printf "Batch data fetch done (%.2fs)\n"
       (realToFrac (diffUTCTime t1 t0) :: Double)
+
+  return waits
 
 -- Catch exceptions arising from the data source and stuff them into
 -- the appropriate requests.  We don't want any exceptions propagating
@@ -99,6 +101,7 @@ wrapFetch reqs fetch =
   case fetch of
     SyncFetch io -> SyncFetch (io `catch` handler)
     AsyncFetch fio -> AsyncFetch (\io -> fio io `catch` handler)
+    FutureFetch io -> FutureFetch (io `catch` (\e -> handler e >> return (return ())))
     FullyAsyncFetch io -> FullyAsyncFetch (io `catch` handler)
   where
     handler :: SomeException -> IO ()
@@ -111,11 +114,18 @@ wrapFetch reqs fetch =
 
 -- | Start all the async fetches first, then perform the sync fetches before
 -- getting the results of the async fetches.
-scheduleFetches :: [PerformFetch] -> IO ()
-scheduleFetches fetches = fully_async_fetches >> async_fetches sync_fetches
+scheduleFetches :: [PerformFetch] -> IO [IO ()]
+scheduleFetches fetches = do
+  fully_async_fetches
+  waits <- future_fetches
+  async_fetches sync_fetches
+  return waits
  where
   fully_async_fetches :: IO ()
   fully_async_fetches = sequence_ [f | FullyAsyncFetch f <- fetches]
+
+  future_fetches :: IO [IO ()]
+  future_fetches = sequence [f | FutureFetch f <- fetches]
 
   async_fetches :: IO () -> IO ()
   async_fetches = compose [f | AsyncFetch f <- fetches]

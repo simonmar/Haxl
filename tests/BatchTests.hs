@@ -24,9 +24,9 @@ testinput = HashMap.fromList [
   "C" .= (3 :: Int),
   "D" .= (4 :: Int) ]
 
-makeTestEnv :: IO (Env UserEnv)
-makeTestEnv = do
-  tao <- MockTAO.initGlobalState
+makeTestEnv :: Bool -> IO (Env UserEnv)
+makeTestEnv future = do
+  tao <- MockTAO.initGlobalState future
   let st = stateSet tao stateEmpty
   initEnv st testinput
 
@@ -38,14 +38,14 @@ expectRoundsWithEnv n result haxl env = do
   stats <- readIORef (statsRef env)
   assertEqual "rounds" n (numRounds stats)
 
-expectRounds :: (Eq a, Show a) => Int -> a -> Haxl a -> Assertion
-expectRounds n result haxl = do
-  env <- makeTestEnv
+expectRounds :: (Eq a, Show a) => Int -> a -> Haxl a -> Bool -> Assertion
+expectRounds n result haxl future = do
+  env <- makeTestEnv future
   expectRoundsWithEnv n result haxl env
 
-expectFetches :: (Eq a, Show a) => Int -> Haxl a -> Assertion
-expectFetches n haxl = do
-  env <- makeTestEnv
+expectFetches :: (Eq a, Show a) => Int -> Haxl a -> Bool -> Assertion
+expectFetches n haxl future = do
+  env <- makeTestEnv future
   _ <- runHaxl env haxl
   stats <- readIORef (statsRef env)
   assertEqual "fetches" n (numFetches stats)
@@ -167,34 +167,36 @@ caching3_ = if nf id1 .> 0 then nf id1 + nf id2 + nf id3 else 0
 --
 -- Basic sanity check on data-cache re-use
 --
-cacheReuse = do
-  env <- makeTestEnv
+cacheReuse future = do
+  env <- makeTestEnv future
   expectRoundsWithEnv 2 12 batching7_ env
 
   -- make a new env
-  tao <- MockTAO.initGlobalState
+  tao <- MockTAO.initGlobalState future
   let st = stateSet tao stateEmpty
   env2 <- initEnvWithData st testinput (caches env)
 
   -- ensure no more data fetching rounds needed
   expectRoundsWithEnv 0 12 batching7_ env2
 
-tests = TestList
-  [ TestLabel "batching1" $ TestCase batching1
-  , TestLabel "batching2" $ TestCase batching2
-  , TestLabel "batching3" $ TestCase batching3
-  , TestLabel "batching4" $ TestCase batching4
-  , TestLabel "batching5" $ TestCase batching5
-  , TestLabel "batching6" $ TestCase batching6
-  , TestLabel "batching7" $ TestCase batching7
-  , TestLabel "batching8" $ TestCase batching8
-  , TestLabel "caching1" $ TestCase caching1
-  , TestLabel "caching2" $ TestCase caching2
-  , TestLabel "caching3" $ TestCase caching3
-  , TestLabel "CacheReuse" $ TestCase cacheReuse
-  , TestLabel "exceptionTest1" $ TestCase exceptionTest1
-  , TestLabel "exceptionTest2" $ TestCase exceptionTest2
-  , TestLabel "deterministicExceptions" $ TestCase deterministicExceptions
+tests :: Bool -> Test
+tests future = TestList
+  [ TestLabel "batching1" $ TestCase (batching1 future)
+  , TestLabel "batching2" $ TestCase (batching2 future)
+  , TestLabel "batching3" $ TestCase (batching3 future)
+  , TestLabel "batching4" $ TestCase (batching4 future)
+  , TestLabel "batching5" $ TestCase (batching5 future)
+  , TestLabel "batching6" $ TestCase (batching6 future)
+  , TestLabel "batching7" $ TestCase (batching7 future)
+  , TestLabel "batching8" $ TestCase (batching8 future)
+  , TestLabel "caching1" $ TestCase (caching1 future)
+  , TestLabel "caching2" $ TestCase (caching2 future)
+  , TestLabel "caching3" $ TestCase (caching3 future)
+  , TestLabel "CacheReuse" $ TestCase (cacheReuse future)
+  , TestLabel "exceptionTest1" $ TestCase (exceptionTest1 future)
+  , TestLabel "exceptionTest2" $ TestCase (exceptionTest2 future)
+  , TestLabel "deterministicExceptions" $
+      TestCase (deterministicExceptions future)
   ]
 
 exceptionTest1 = expectRounds 1 []
@@ -204,8 +206,8 @@ exceptionTest2 = expectRounds 1 [7..12] $ liftA2 (++)
   (withDefault [] (friendsOf 101))
   (withDefault [] (friendsOf 2))
 
-deterministicExceptions = do
-  env <- makeTestEnv
+deterministicExceptions future = do
+  env <- makeTestEnv future
   let haxl =
         sequence [ do _ <- friendsOf =<< id1; throw (NotFound "xxx")
                  , throw (NotFound "yyy")
