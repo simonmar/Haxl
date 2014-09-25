@@ -26,7 +26,8 @@ main = do
   case test of
     "par1" -> runHaxl env $ Haxl.sequence_ (replicate n (listWombats 3))
     "par2" -> runHaxl env $ Haxl.sequence_ (map listWombats [1..fromIntegral n])
-    "seq" -> runHaxl env $ replicateM_ n (listWombats 3)
+    "seq1" -> runHaxl env $ replicateM_ n (listWombats 3)
+    "seq2" -> runHaxl env $ foldl (>>)  (return []) (map listWombats [1.. fromIntegral n]) >> return ()
     "tree" -> runHaxl env $ tree n >> return ()
   t1 <- getCurrentTime
   printf "%d reqs: %.2fs\n" n (realToFrac (t1 `diffUTCTime` t0) :: Double)
