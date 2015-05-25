@@ -55,6 +55,12 @@ import Haxl.Core.DataCache as DataCache
 
 import qualified Data.Text as Text
 import Control.Exception (Exception(..), SomeException, throwIO)
+#if __GLASGOW_HASKELL__ >= 708
+import Control.Exception (SomeAsyncException(..))
+#endif
+#if __GLASGOW_HASKELL__ >= 710
+import Control.Exception (AllocationLimitExceeded(..))
+#endif
 import qualified Control.Exception
 import Control.Applicative hiding (Const)
 import GHC.Exts (IsString(..))
@@ -136,6 +142,7 @@ data CompleteReq u =
 -- a continuation.
 data Result u a
   = Done a
+  | Throw SomeException
   | forall b . Blocked
       !(ContVar u b)      -- ^ What we are blocked on
       (GenHaxl u a)
@@ -146,6 +153,7 @@ data Result u a
 
 instance (Show a) => Show (Result u a) where
   show (Done a) = printf "Done(%s)" $ show a
+  show (Throw e) = printf "Throw(%s)" $ show e
   show Blocked{} = "Blocked"
 
 instance Monad (GenHaxl u) where
@@ -153,7 +161,8 @@ instance Monad (GenHaxl u) where
   GenHaxl m >>= k = GenHaxl $ \env ref -> do
     e <- m env ref
     case e of
-      Done a       -> unHaxl (k a) env ref
+      Done a         -> unHaxl (k a) env ref
+      Throw e        -> return (Throw e)
       Blocked cont f -> return (Blocked cont (f >>= k))
 
 instance Functor (GenHaxl u) where
@@ -172,14 +181,15 @@ instance Applicative (GenHaxl u) where
         ra <- aa env ref
         case ra of
           Done a -> return (Done (f a))
+          Throw e -> return (Throw e)
           Blocked cvar fcont -> return (Blocked cvar (f <$> fcont))
+      Throw e -> return (Throw e)
       Blocked cvar1 fcont -> do
-        e <- Control.Exception.try $ aa env ref
-        case e of
-          Left e -> return (Blocked cvar1 (fcont <*> throw (e::SomeException)))
-          Right ra -> case ra of
-            Done a -> return (Blocked cvar1 (do f <- fcont; return (f a)))
-            Blocked cvar2 acont -> do        -- Note [Blocked/Blocked]
+         ra <- aa env ref
+         case ra of
+           Done a -> return (Blocked cvar1 (do f <- fcont; return (f a)))
+           Throw e -> return (Blocked cvar1 (fcont >> throw e))
+           Blocked cvar2 acont -> do        -- Note [Blocked/Blocked]
               i <- newIVar
               modifyIORef' cvar1 $ \cs -> (fcont >>= putIVar i) : cs
               let cont =  do a <- acont; f <- getIVar i; return (f a)
@@ -437,17 +447,20 @@ newContVar = newIORef []
 
 -- | Throw an exception in the Haxl monad
 throw :: (Exception e) => e -> GenHaxl u a
-throw e = GenHaxl $ \_env _ref -> throwIO e
+throw e = GenHaxl $ \_env _ref -> raise e
+
+raise :: (Exception e) => e -> IO (Result u a)
+raise = return . Throw . toException
 
 -- | Catch an exception in the Haxl monad
 catch :: Exception e => GenHaxl u a -> (e -> GenHaxl u a) -> GenHaxl u a
 catch (GenHaxl m) h = GenHaxl $ \env ref -> do
-   e <- Control.Exception.try $ m env ref
+   e <- m env ref
    case e of
-     Left e | Just e' <- fromException e -> unHaxl (h e') env ref
-     Left e -> throwIO e
-     Right (Done a) -> return (Done a)
-     Right (Blocked cvar k) -> return (Blocked cvar (catch k h))
+     Done a -> return (Done a)
+     Throw e | Just e' <- fromException e -> unHaxl (h e') env ref
+             | otherwise -> return (Throw e)
+     Blocked cvar k -> return (Blocked cvar (catch k h))
 
 -- | Catch exceptions that satisfy a predicate
 catchIf
@@ -530,17 +543,57 @@ cacheResult req val = GenHaxl $ \env st -> do
     Uncached rvar cvar _ivar -> do
       result <- Control.Exception.try val
       putResult rvar result
-      done result
+      case result of
+        Left e -> do rethrowAsyncExceptions e; done result
+        _other -> done result
     Cached result -> done result
     CachedNotFetched _ _ -> corruptCache
   where
-    corruptCache = throwIO . DataSourceError $ Text.concat
+    corruptCache = raise . DataSourceError $ Text.concat
       [ textShow req
       , " has a corrupted cache value: these requests are meant to"
       , " return immediately without an intermediate value. Either"
       , " the cache was updated incorrectly, or you're calling"
       , " cacheResult on a query that involves a blocking fetch."
       ]
+
+-- We must be careful about turning IO monad exceptions into Haxl
+-- exceptions.  An IO monad exception will normally propagate right
+-- out of runHaxl and terminate the whole computation, whereas a Haxl
+-- exception can get dropped on the floor, if it is on the right of
+-- <*> and the left side also throws, for example.  So turning an IO
+-- monad exception into a Haxl exception is a dangerous thing to do.
+-- In particular, we never want to do it for an asynchronous exception
+-- (AllocationLimitExceeded, ThreadKilled, etc.), because these are
+-- supposed to unconditionally terminate the computation.
+--
+-- There are three places where we take an arbitrary IO monad exception and
+-- turn it into a Haxl exception:
+--
+--  * wrapFetchInCatch.  Here we want to propagate a failure of the
+--    data source to the callers of the data source, but if the
+--    failure came from elsewhere (an asynchronous exception), then we
+--    should just propagate it
+--
+--  * cacheResult (cache the results of IO operations): again,
+--    failures of the IO operation should be visible to the caller as
+--    a Haxl exception, but we exclude asynchronous exceptions from
+--    this.
+
+--  * unsafeToHaxlException: assume the caller knows what they're
+--    doing, and just wrap all exceptions.
+--
+rethrowAsyncExceptions :: SomeException -> IO ()
+rethrowAsyncExceptions e
+#if __GLASGOW_HASKELL__ >= 708
+  | Just SomeAsyncException{} <- fromException e = throwIO e
+#endif
+#if __GLASGOW_HASKELL__ >= 710
+  | Just AllocationLimitExceeded{} <- fromException e = throwIO e
+    -- AllocationLimitExceeded is not a child of SomeAsyncException,
+    -- but it should be.
+#endif
+  | otherwise = return ()
 
 -- | Inserts a request/result pair into the cache. Throws an exception
 -- if the request has already been issued, either via 'dataFetch' or
@@ -563,7 +616,7 @@ cacheRequest request result = GenHaxl $ \env _st -> do
     -- It is an error if the request is already in the cache.  We can't test
     -- whether the cached result is the same without adding an Eq constraint,
     -- and we don't necessarily have Eq for all results.
-    _other -> throwIO $
+    _other -> raise $
       DataSourceError "cacheRequest: request is already in the cache"
 
 instance IsString a => IsString (GenHaxl u a) where
@@ -598,8 +651,7 @@ cachedComputation req haxl = GenHaxl $ \env ref -> do
 
 -- | Lifts an 'Either' into either 'Throw' or 'Done'.
 done :: Either SomeException a -> IO (Result u a)
-done (Left e) = throwIO e
-done (Right a) = return (Done a)
+done = return . either Throw Done
 
 -- | Lifts an 'Either' into either 'Throw' or 'Done'.
 doneH :: Either SomeException a -> GenHaxl u a
