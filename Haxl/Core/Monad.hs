@@ -31,7 +31,7 @@ module Haxl.Core.Monad (
     GenHaxl (..), runHaxl,
     env,
 
-    IVar(..), IVarContents(..),
+    IVar(..), IVarContents(..), ResultVal(..),
 
     -- * Exceptions
     throw, catch, catchIf, try, tryToHaxlException,
@@ -97,7 +97,7 @@ data SchedState u = SchedState
   { reqStoreRef :: !(IORef (RequestStore u))
        -- ^ The set of requests that we have not submitted to data sources yet.
        -- Owned by the scheduler.
-  , runQueue    :: !(IORef [GenHaxl u ()])
+  , runQueue    :: !(IORef [HaxlComp u])
        -- ^ Computations waiting to run.
        -- Owned by the scheduler.
   , numRequests :: !(IORef Int)
@@ -114,18 +114,21 @@ data SchedState u = SchedState
 -- block on a resource, a 'ContVar' is created to track the blocked
 -- computations.  If another computation becomes blocked on the same
 -- resource, it will be added to the list in this 'IORef'.
-type ContVar u a = IORef [GenHaxl u ()] -- Owned by the scheduler
+type ContVar u a = IORef [HaxlComp u] -- Owned by the scheduler
   -- morally this list contains @a -> GenHaxl u ()@, but instead of
   -- using a function, each computation begins with `getIVar` to grab
   -- the value it is waiting for.  This is less type safe but a little
   -- faster (benchmarked with tests/MonadBench.hs).
+
+data HaxlComp u =
+  forall a . HaxlComp (GenHaxl u a) !(IVar u a)
 
 -- | A synchronisation point.  It either contains the value, or a list
 -- of computations waiting for the value.
 newtype IVar u a = IVar (IORef (IVarContents u a))
 
 data IVarContents u a
-  = IVarFull a
+  = IVarFull (ResultVal a)
   | IVarEmpty !(ContVar u a)
 
 -- | A completed request from a data source, containing the result,
@@ -135,7 +138,30 @@ data IVarContents u a
 -- the relevant computations.
 data CompleteReq u =
   forall a . CompleteReq (Either SomeException a)
-                         (IVar u (Either SomeException a))
+                         (IVar u a)
+
+data ResultVal a
+  = Ok a
+  | ThrowHaxl SomeException
+  | ThrowIO SomeException
+
+done :: ResultVal a -> IO (Result u a)
+done (Ok a) = return (Done a)
+done (ThrowHaxl e) = return (Throw e)
+done (ThrowIO e) = throwIO e
+
+eitherToResultThrowIO :: Either SomeException a -> ResultVal a
+eitherToResultThrowIO (Right a) = Ok a
+eitherToResultThrowIO (Left e)
+  | Just HaxlException{} <- fromException e = ThrowHaxl e
+  | otherwise = ThrowIO e
+
+eitherToResult :: Either SomeException a -> ResultVal a
+eitherToResult (Right a) = Ok a
+eitherToResult (Left e) = ThrowHaxl e
+
+doneEither :: Either SomeException a -> IO (Result u a)
+doneEither = done . eitherToResult
 
 -- | The result of a computation is either 'Done' with a value, 'Throw'
 -- with an exception, or 'Blocked' on the result of a data fetch with
@@ -150,6 +176,21 @@ data Result u a
          -- we're nested inside multiple '>>=', before finally being
          -- added to the 'ContVar'.  Morally @b -> GenHaxl u a@, but see
          -- 'ContVar',
+
+-- haxl exceptions:
+--   - want to be able to discard on the right of <*>
+-- IO exceptions / error / AllocationLimitExceeded
+--   - must not be discarded on the right of <*>
+-- If we use throwIO for Haxl exceptions, then
+--   - have to catch when running the right of <*>,
+--     and distinguish between Haxl exceptions and other exceptions
+-- If we use Throw for Haxl exceptions,
+--   - don't need to do try when running the right of <*>
+--   - but we need to distinguish between Throw and throwIO in the
+--     contents of an IVar
+--   - putIVar needs to be built-in to ContVar
+--
+-- ToDo: check how all this interacts with memoization
 
 instance (Show a) => Show (Result u a) where
   show (Done a) = printf "Done(%s)" $ show a
@@ -170,6 +211,7 @@ instance Functor (GenHaxl u) where
     r <- m env ref
     case r of
      Done a -> return (Done (f a))
+     Throw e -> return (Throw e)
      Blocked cvar cont -> return (Blocked cvar (fmap f cont))
 
 instance Applicative (GenHaxl u) where
@@ -191,7 +233,7 @@ instance Applicative (GenHaxl u) where
            Throw e -> return (Blocked cvar1 (fcont >> throw e))
            Blocked cvar2 acont -> do        -- Note [Blocked/Blocked]
               i <- newIVar
-              modifyIORef' cvar1 $ \cs -> (fcont >>= putIVar i) : cs
+              modifyIORef' cvar1 $ \cs -> HaxlComp fcont i : cs
               let cont =  do a <- acont; f <- getIVar i; return (f a)
               return (Blocked cvar2 cont)
 
@@ -227,19 +269,8 @@ getIVar :: IVar u a -> GenHaxl u a
 getIVar (IVar !ref) = GenHaxl $ \_ _ -> do
   e <- readIORef ref
   case e of
-    IVarFull a -> return (Done a)
+    IVarFull a -> done a
     IVarEmpty cref -> return (Blocked cref (getIVar (IVar ref)))
-
-putIVar :: IVar u a -> a -> GenHaxl u ()
-putIVar (IVar !ref) a = GenHaxl $ \_ SchedState{..} -> do
-  e <- readIORef ref
-  case e of
-    IVarFull _ -> error "putIVar: multiple put"
-    IVarEmpty cref -> do
-      writeIORef ref (IVarFull a)
-      haxls <- readIORef cref
-      modifyIORef' runQueue (haxls ++)
-      return (Done ())
 
 newIVar :: IO (IVar u a)
 newIVar = do
@@ -257,7 +288,8 @@ data SchedPolicy
 runHaxl :: forall u a. Env u -> GenHaxl u a -> IO a
 runHaxl env haxl = do
   q <- newIORef []                   -- run queue
-  resultRef <- newIORef Nothing      -- where to put the final result
+  cv <- newContVar
+  resultRef <- newIORef (IVarEmpty cv) -- where to put the final result
   rs <- newIORef noRequests          -- RequestStore
   nr <- newIORef 0                   -- numRequests
   comps <- newTVarIO []              -- completion queue
@@ -267,19 +299,47 @@ runHaxl env haxl = do
              , numRequests = nr
              , completions = comps
              , pendingWaits = [] }
-  schedule st (haxl >>= unsafeLiftIO . writeIORef resultRef . Just)
+  schedule st (HaxlComp haxl (IVar resultRef))
   r <- readIORef resultRef
   case r of
-    Nothing -> throwIO (CriticalError "runHaxl: missing result")
-    Just a  -> return a
+    IVarEmpty _ -> throwIO (CriticalError "runHaxl: missing result")
+    IVarFull (Ok a)  -> return a
+    IVarFull (ThrowIO e)  -> throwIO e
+    IVarFull (ThrowHaxl e)  -> throwIO e
  where
-  schedule :: SchedState u -> GenHaxl u () -> IO ()
-  schedule q (GenHaxl run) = do
-    r <- run env q
+  schedule :: SchedState u -> HaxlComp u -> IO ()
+  schedule q !(HaxlComp (GenHaxl run) (IVar !ref)) = do
+    r <- Control.Exception.try $ run env q
     case r of
-      Done _ -> reschedule q
-      Blocked cref fn -> do
-        modifyIORef' cref (fn:)
+      Left ex -> do
+        e <- readIORef ref
+        case e of
+         IVarFull _ -> error "multiple put"
+         IVarEmpty cref -> do
+           writeIORef ref (IVarFull (ThrowIO ex))
+           haxls <- readIORef cref
+           modifyIORef' (runQueue q) (haxls ++)
+           reschedule q
+      Right (Done a) -> do
+        e <- readIORef ref
+        case e of
+         IVarFull _ -> error "multiple put"
+         IVarEmpty cref -> do
+           writeIORef ref (IVarFull (Ok a))
+           haxls <- readIORef cref
+           modifyIORef' (runQueue q) (haxls ++)
+           reschedule q
+      Right (Throw ex) -> do
+        e <- readIORef ref
+        case e of
+         IVarFull _ -> error "multiple put"
+         IVarEmpty cref -> do
+           writeIORef ref (IVarFull (ThrowHaxl ex))
+           haxls <- readIORef cref
+           modifyIORef' (runQueue q) (haxls ++)
+           reschedule q
+      Right (Blocked cref fn) -> do
+        modifyIORef' cref (HaxlComp fn (IVar ref):)
         reschedule q
 
   reschedule :: SchedState u -> IO ()
@@ -349,7 +409,7 @@ runHaxl env haxl = do
                   -- pushed on the front of the completions list) and
                   -- therefore overrides it.
                 IVarEmpty cv -> do
-                  writeIORef cr (IVarFull a)
+                  writeIORef cr (IVarFull (eitherToResult a))
                   modifyIORef' numRequests (subtract 1)
                   readIORef cv
         jobs <- mapM getComplete comps
@@ -381,18 +441,18 @@ data CacheResult u a
   -- | The request hadn't been seen until now.
   = Uncached
        (ResultVar a)
-       !(ContVar u (Either SomeException a))
-       !(IVar u (Either SomeException a))
+       !(ContVar u (ResultVal a))
+       !(IVar u a)
 
   -- | The request has been seen before, but its result has not yet been
   -- fetched.
   | CachedNotFetched
-      !(ContVar u (Either SomeException a))
-      !(IVar u (Either SomeException a))
+      !(ContVar u (ResultVal a))
+      !(IVar u a)
 
   -- | The request has been seen before, and its result has already been
   -- fetched.
-  | Cached (Either SomeException a)
+  | Cached (ResultVal a)
 
 
 -- | Checks the data cache for the result of a request.
@@ -435,8 +495,9 @@ checkCache flags SchedState{..} ref req = do
         IVarEmpty cvar -> return (CachedNotFetched cvar (IVar cr))
         IVarFull r -> do
           ifTrace flags 3 $ putStrLn $ case r of
-            Left _ -> "Cached error: " ++ show req
-            Right _ -> "Cached request: " ++ show req
+            ThrowIO _ -> "Cached error: " ++ show req
+            ThrowHaxl _ -> "Cached error: " ++ show req
+            Ok _ -> "Cached request: " ++ show req
           return (Cached r)
 
 newContVar :: IO (ContVar u a)
@@ -502,11 +563,11 @@ dataFetch req = GenHaxl $ \env st@SchedState{..} -> do
     -- will be fetched in the next round.
     Uncached rvar cvar ivar -> do
       modifyIORef' reqStoreRef $ \bs -> addRequest (BlockedFetch req rvar) bs
-      return $ Blocked cvar (getIVar ivar >>= doneH)
+      return $ Blocked cvar (getIVar ivar)
 
     -- Seen before but not fetched yet.  We're blocked, but we don't have
     -- to add the request to the RequestStore.
-    CachedNotFetched cvar ivar -> return $ Blocked cvar (getIVar ivar >>= doneH)
+    CachedNotFetched cvar ivar -> return $ Blocked cvar (getIVar ivar)
 
     -- Cached: either a result, or an exception
     Cached r -> done r
@@ -532,7 +593,7 @@ uncachedRequest req = GenHaxl $ \_env SchedState{..} -> do
         writeTVar completions (CompleteReq r cr : cs)
   rvar <- newEmptyResult done
   modifyIORef' numRequests (+1)
-  return $ Blocked cvar (getIVar cr >>= doneH)
+  return $ Blocked cvar (getIVar cr)
 
 -- | Transparently provides caching. Useful for datasources that can
 -- return immediately, but also caches values.
@@ -543,9 +604,8 @@ cacheResult req val = GenHaxl $ \env st -> do
     Uncached rvar cvar _ivar -> do
       result <- Control.Exception.try val
       putResult rvar result
-      case result of
-        Left e -> do rethrowAsyncExceptions e; done result
-        _other -> done result
+      -- important to re-throw IO exceptions here
+      done (eitherToResultThrowIO result)
     Cached result -> done result
     CachedNotFetched _ _ -> corruptCache
   where
@@ -579,21 +639,10 @@ cacheResult req val = GenHaxl $ \env st -> do
 --    failures of the IO operation should be visible to the caller as
 --    a Haxl exception, but we exclude asynchronous exceptions from
 --    this.
-
+--
 --  * unsafeToHaxlException: assume the caller knows what they're
 --    doing, and just wrap all exceptions.
 --
-rethrowAsyncExceptions :: SomeException -> IO ()
-rethrowAsyncExceptions e
-#if __GLASGOW_HASKELL__ >= 708
-  | Just SomeAsyncException{} <- fromException e = throwIO e
-#endif
-#if __GLASGOW_HASKELL__ >= 710
-  | Just AllocationLimitExceeded{} <- fromException e = throwIO e
-    -- AllocationLimitExceeded is not a child of SomeAsyncException,
-    -- but it should be.
-#endif
-  | otherwise = return ()
 
 -- | Inserts a request/result pair into the cache. Throws an exception
 -- if the request has already been issued, either via 'dataFetch' or
@@ -609,7 +658,7 @@ cacheRequest request result = GenHaxl $ \env _st -> do
   cache <- readIORef (cacheRef env)
   case DataCache.lookup request cache of
     Nothing -> do
-      cr <- IVar <$> newIORef (IVarFull result)
+      cr <- IVar <$> newIORef (IVarFull (eitherToResult result))
       writeIORef (cacheRef env) $! DataCache.insert request cr cache
       return (Done ())
 
@@ -638,7 +687,7 @@ cachedComputation req haxl = GenHaxl $ \env ref -> do
     Uncached rvar cvar _ivar -> do
       let
           with_result :: Either SomeException a -> GenHaxl u a
-          with_result r = GenHaxl $ \_ _ -> do putResult rvar r; done r
+          with_result r = GenHaxl $ \_ _ -> do putResult rvar r; done (eitherToResult r)
 
       unHaxl (try haxl >>= with_result) env ref
 
@@ -646,16 +695,8 @@ cachedComputation req haxl = GenHaxl $ \env ref -> do
     -- have to block until the result is available.  Note that we might
     -- have to block repeatedly, because the Haxl computation might block
     -- multiple times before it has a result.
-    CachedNotFetched cvar ivar -> return $ Blocked cvar (getIVar ivar >>= doneH)
+    CachedNotFetched cvar ivar -> return $ Blocked cvar (getIVar ivar)
     Cached r -> done r
-
--- | Lifts an 'Either' into either 'Throw' or 'Done'.
-done :: Either SomeException a -> IO (Result u a)
-done = return . either Throw Done
-
--- | Lifts an 'Either' into either 'Throw' or 'Done'.
-doneH :: Either SomeException a -> GenHaxl u a
-doneH a = GenHaxl $ \_ _ -> done a
 
 {-
 -- | Dump the contents of the cache as Haskell code that, when

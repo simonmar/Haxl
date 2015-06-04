@@ -46,7 +46,7 @@ newtype DataCache u = DataCache (HashMap TypeRep (SubCache u))
 -- 'Hashable' and 'Eq' once per request type.
 data SubCache u =
   forall req a . (Hashable (req a), Eq (req a), Show (req a), Show a) =>
-       SubCache ! (HashMap (req a) (IVar u (Either SomeException a)))
+       SubCache ! (HashMap (req a) (IVar u a))
        -- NB. the inner HashMap is strict, to avoid building up
        -- a chain of thunks during repeated insertions.
 
@@ -59,7 +59,7 @@ insert
   :: (Hashable (r a), Typeable (r a), Eq (r a), Show (r a), Show a)
   => r a
   -- ^ Request
-  -> IVar u (Either SomeException a)
+  -> IVar u a
   -- ^ Result
   -> DataCache u
   -> DataCache u
@@ -78,7 +78,7 @@ lookup
   => r a
   -- ^ Request
   -> DataCache u
-  -> Maybe (IVar u (Either SomeException a))
+  -> Maybe (IVar u a)
 
 lookup req (DataCache m) =
       case HashMap.lookup (typeOf req) m of
