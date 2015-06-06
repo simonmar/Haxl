@@ -138,7 +138,7 @@ data IVarContents u a
 -- the relevant computations.
 data CompleteReq u =
   forall a . CompleteReq (Either SomeException a)
-                         (IVar u a)
+                         !(IVar u a)  -- IVar because the result is cached
 
 data ResultVal a
   = Ok a
@@ -204,7 +204,11 @@ instance Monad (GenHaxl u) where
     case e of
       Done a         -> unHaxl (k a) env ref
       Throw e        -> return (Throw e)
-      Blocked cont f -> return (Blocked cont (f >>= k))
+      Blocked cvar f -> do
+         cvar1 <- newContVar
+         i <- IVar <$> newIORef (IVarEmpty cvar1)
+         modifyIORef' cvar (HaxlComp f i :)
+         return (Blocked cvar1 (getIVar i >>= k))
 
 instance Functor (GenHaxl u) where
   fmap f (GenHaxl m) = GenHaxl $ \env ref -> do
@@ -233,7 +237,7 @@ instance Applicative (GenHaxl u) where
            Throw e -> return (Blocked cvar1 (fcont >> throw e))
            Blocked cvar2 acont -> do        -- Note [Blocked/Blocked]
               i <- newIVar
-              modifyIORef' cvar1 $ \cs -> HaxlComp fcont i : cs
+              modifyIORef' cvar1 (HaxlComp fcont i :)
               let cont =  do a <- acont; f <- getIVar i; return (f a)
               return (Blocked cvar2 cont)
 
