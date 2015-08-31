@@ -256,9 +256,9 @@ instance Applicative (GenHaxl u) where
            Blocked cvar2 acont -> trace_ "Blocked/Blocked" $ do
              -- Note [Blocked/Blocked]
               i <- newIVar
-              modifyIORef' cvar1 (JobCons fcont i)
-              let cont =  do a <- acont; getIVar i (\f -> return (f a))
-              return (Blocked cvar2 cont)
+              modifyIORef' cvar2 (JobCons acont i)
+              let cont =  do f <- fcont; getIVar i (\a -> return (f a))
+              return (Blocked cvar1 cont)
 
 
 
