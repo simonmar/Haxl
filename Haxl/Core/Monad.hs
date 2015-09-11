@@ -184,11 +184,26 @@ data Result u a
   | Throw SomeException
   | forall b . Blocked
       !(ContVar u b)      -- ^ What we are blocked on
-      (GenHaxl u a)
+      (Cont u a)
          -- ^ The continuation.  This might be wrapped further if
          -- we're nested inside multiple '>>=', before finally being
          -- added to the 'ContVar'.  Morally @b -> GenHaxl u a@, but see
          -- 'ContVar',
+
+data Cont u a
+  = ContGetIVar (IVar u a)
+  | forall b . ContFmap (b -> a) (Cont u b)
+  | forall b . ContBind (Cont u b) (b -> GenHaxl u a)
+  | forall e . Exception e => ContCatch (Cont u a) (e -> GenHaxl u a)
+
+runCont :: Cont u a -> GenHaxl u a
+runCont (ContGetIVar ivar) = getIVar ivar return
+runCont (ContBind (ContBind c k1) k2) = runCont (c `ContBind` (k1 >=> k2))
+runCont (ContBind (ContFmap f c) k) = runCont (c `ContBind` (\x -> k (f x)))
+runCont (ContBind (ContGetIVar ivar) k) = getIVar ivar k
+runCont (ContBind c k) = runCont c >>= k
+runCont (ContCatch c h) = catch (runCont c) h
+runCont (ContFmap f c) = fmap f (runCont c)
 
 -- haxl exceptions:
 --   - want to be able to discard on the right of <*>
@@ -217,12 +232,8 @@ instance Monad (GenHaxl u) where
     case e of
       Done a         -> unHaxl (k a) env ref
       Throw e        -> return (Throw e)
-      Blocked cvar f -> trace_ ">>= Blocked" $ do
-         cvar1 <- newContVar
-         i <- IVar <$> newIORef (IVarEmpty cvar1)
-         modifyIORef' cvar (JobCons f i)
-         return (Blocked cvar1 (getIVar i k))
-
+      Blocked cvar f -> trace_ ">>= Blocked" $
+        return (Blocked cvar (ContBind f k))
 
 instance Functor (GenHaxl u) where
   fmap f (GenHaxl m) = GenHaxl $ \env ref -> do
@@ -231,7 +242,7 @@ instance Functor (GenHaxl u) where
      Done a -> return (Done (f a))
      Throw e -> return (Throw e)
      Blocked cvar cont -> trace_ "fmap Blocked" $
-       return (Blocked cvar (fmap f cont))
+       return (Blocked cvar (ContFmap f cont))
 
 instance Applicative (GenHaxl u) where
   pure = return
@@ -244,20 +255,20 @@ instance Applicative (GenHaxl u) where
           Done a -> trace_ "Done/Done" $ return (Done (f a))
           Throw e -> trace_ "Done/Throe" $ return (Throw e)
           Blocked cvar fcont -> trace_ "Done/Blocked" $
-            return (Blocked cvar (f <$> fcont))
+            return (Blocked cvar (ContFmap f fcont))
       Throw e -> trace_ "Throw" $ return (Throw e)
       Blocked cvar1 fcont -> do
          ra <- aa env ref
          case ra of
            Done a -> trace_ "Blocked/Done" $
-             return (Blocked cvar1 (($ a) <$> fcont))
+             return (Blocked cvar1 (ContFmap ($ a) fcont))
            Throw e -> trace_ "Blocked/Throw" $
-             return (Blocked cvar1 (fcont >> throw e))
+             return (Blocked cvar1 (ContBind fcont (\_ -> throw e)))
            Blocked cvar2 acont -> trace_ "Blocked/Blocked" $ do
              -- Note [Blocked/Blocked]
               i <- newIVar
-              modifyIORef' cvar2 (JobCons acont i)
-              let cont =  do f <- fcont; getIVar i (\a -> return (f a))
+              modifyIORef' cvar2 ((JobCons $! runCont acont) i)
+              let cont =  fcont `ContBind` \f -> getIVar i (\a -> return (f a))
               return (Blocked cvar1 cont)
 
 
@@ -294,7 +305,7 @@ getIVar (IVar !ref) cont = GenHaxl $ \env sref -> do
     IVarFull (Ok a) -> case cont a of GenHaxl fn -> fn env sref
     IVarFull (ThrowHaxl e) -> return (Throw e)
     IVarFull (ThrowIO e) -> throwIO e
-    IVarEmpty cref -> return (Blocked cref (getIVar (IVar ref) cont))
+    IVarEmpty cref -> return (Blocked cref (ContGetIVar (IVar ref) `ContBind` cont))
 
 newIVar :: IO (IVar u a)
 newIVar = do
@@ -363,7 +374,7 @@ runHaxl env haxl = do
            modifyIORef' (runQueue q) (appendJobList haxls)
            reschedule q
       Right (Blocked cref fn) -> do
-        modifyIORef' cref (JobCons fn (IVar ref))
+        modifyIORef' cref ((JobCons $! runCont fn) (IVar ref))
         reschedule q
 
   reschedule :: SchedState u -> IO ()
@@ -549,7 +560,7 @@ catch (GenHaxl m) h = GenHaxl $ \env ref -> do
      Done a -> return (Done a)
      Throw e | Just e' <- fromException e -> unHaxl (h e') env ref
              | otherwise -> return (Throw e)
-     Blocked cvar k -> return (Blocked cvar (catch k h))
+     Blocked cvar k -> return (Blocked cvar (ContCatch k h))
 
 -- | Catch exceptions that satisfy a predicate
 catchIf
@@ -591,11 +602,11 @@ dataFetch req = GenHaxl $ \env st@SchedState{..} -> do
     -- will be fetched in the next round.
     Uncached rvar cvar ivar -> do
       modifyIORef' reqStoreRef $ \bs -> addRequest (BlockedFetch req rvar) bs
-      return $ Blocked cvar (getIVar ivar return)
+      return $ Blocked cvar (ContGetIVar ivar)
 
     -- Seen before but not fetched yet.  We're blocked, but we don't have
     -- to add the request to the RequestStore.
-    CachedNotFetched cvar ivar -> return $ Blocked cvar (getIVar ivar return)
+    CachedNotFetched cvar ivar -> return $ Blocked cvar (ContGetIVar ivar)
 
     -- Cached: either a result, or an exception
     Cached r -> done r
@@ -621,7 +632,7 @@ uncachedRequest req = GenHaxl $ \_env SchedState{..} -> do
         writeTVar completions (CompleteReq r cr : cs)
   rvar <- newEmptyResult done
   modifyIORef' numRequests (+1)
-  return $ Blocked cvar (getIVar cr return)
+  return $ Blocked cvar (ContGetIVar cr)
 
 -- | Transparently provides caching. Useful for datasources that can
 -- return immediately, but also caches values.
@@ -723,7 +734,7 @@ cachedComputation req haxl = GenHaxl $ \env ref -> do
     -- have to block until the result is available.  Note that we might
     -- have to block repeatedly, because the Haxl computation might block
     -- multiple times before it has a result.
-    CachedNotFetched cvar ivar -> return $ Blocked cvar (getIVar ivar return)
+    CachedNotFetched cvar ivar -> return $ Blocked cvar (ContGetIVar ivar)
     Cached r -> done r
 
 {-
