@@ -12,8 +12,21 @@ import Test.HUnit
 
 import Data.Aeson
 import qualified Data.ByteString.Lazy.Char8 as BS
+import Data.List
 
 import Control.Exception (Exception(..))
+
+import ExampleDataSource
+
+testEnv = do
+  -- To use a data source, we need to initialize its state:
+  exstate <- ExampleDataSource.initGlobalState
+
+  -- And create a StateStore object containing the states we need:
+  let st = stateSet exstate stateEmpty
+
+  -- Create the Env:
+  initEnv st ()
 
 useless :: String -> GenHaxl u Bool
 useless _ = throw (NotFound "ha ha")
@@ -72,6 +85,38 @@ exceptions =
               return True)
             `catch` \InternalError{} -> return False
     assertBool "catchIf2" (not e)
+
+    -- test tryToHaxlException
+    e <- runHaxl en $ tryToHaxlException $ head []
+    assertBool "tryToHaxlException1" $
+      case e of
+        Left ex | Just NonHaxlException{} <- fromException (toException ex)
+          -> True
+        _ -> False
+
+    env <- testEnv
+    e <- runHaxl env $ tryToHaxlException $ do
+      xs <- listWombats 3
+      return $! length xs `quot` 0
+    print e
+    assertBool "tryToHaxlException1" $
+      case e of
+        Left ex | Just NonHaxlException{} <- fromException (toException ex)
+          -> True
+        _ -> False
+
+    env <- testEnv
+    e <- runHaxl env $ mapM tryToHaxlException
+      [ do xs <- listWombats 3; return $! length xs `quot` 0
+      , head []
+      ]
+    print e
+    assertBool "tryToHaxlException2" $
+      case e of
+        [Left ex1, Left ex2]
+           | "divide" `isInfixOf` show ex1
+           , "head" `isInfixOf` show ex2 -> True
+        _ -> False
   where
   isLeft Left{} = True
   isLeft _ = False

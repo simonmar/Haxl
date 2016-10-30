@@ -12,13 +12,15 @@ import AdoTests
 import ProfileTests
 #endif
 import MemoizationTests
+import FullyAsyncTest
 
 import Test.HUnit
 
 allTests :: Test
 allTests = TestList
   [ TestLabel "ExampleDataSource" TestExampleDataSource.tests
-  , TestLabel "BatchTests" BatchTests.tests
+  , TestLabel "BatchTests" $ BatchTests.tests True
+  , TestLabel "BatchTests" $ BatchTests.tests False
   , TestLabel "CoreTests" CoreTests.tests
   , TestLabel "DataCacheTests" DataCacheTest.tests
 #ifdef HAVE_APPLICATIVEDO
@@ -28,4 +30,5 @@ allTests = TestList
   , TestLabel "ProfileTests" ProfileTests.tests
 #endif
   , TestLabel "MemoizationTests" MemoizationTests.tests
+  , TestLabel "FullyAsyncTest" FullyAsyncTest.tests
   ]

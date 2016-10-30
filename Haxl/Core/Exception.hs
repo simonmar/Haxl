@@ -52,6 +52,7 @@ module Haxl.Core.Exception (
   -- ** Internal exceptions
   CriticalError(..),
   DataSourceError(..),
+  NonHaxlException(..),
 
   -- ** Logic exceptions
   NotFound(..),

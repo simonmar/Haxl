@@ -21,7 +21,7 @@ module Haxl.Core.DataCache
   , insertNotShowable
   , insertWithShow
   , lookup
-  , showCache
+--  , showCache
   ) where
 
 import Data.Hashable
@@ -103,6 +103,7 @@ lookup req (DataCache m) =
         Just (SubCache _ _ sc) ->
            unsafeCoerce (HashMap.lookup (unsafeCoerce req) sc)
 
+{-
 -- | Dumps the contents of the cache, with requests and responses
 -- converted to 'String's using the supplied show functions.  The
 -- entries are grouped by 'TypeRep'.  Note that this will fail if
@@ -128,3 +129,4 @@ showCache (DataCache cache) = mapM goSubCache (HashMap.toList cache)
         Just (Left e) -> return (Just (showReq req, Left e))
         Just (Right result) ->
           return (Just (showReq req, Right (showRes result)))
+-}

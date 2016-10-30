@@ -71,13 +71,9 @@ module Haxl.Core.Types (
   -- * Result variables
   ResultVar(..),
   newEmptyResult,
-  newResult,
   putFailure,
   putResult,
   putSuccess,
-  takeResult,
-  tryReadResult,
-  tryTakeResult,
 
   -- * Default fetch implementations
   asyncFetch, asyncFetchWithDispatch,
@@ -381,7 +377,16 @@ type Request req a =
 --
 data PerformFetch
   = SyncFetch  (IO ())
+    -- ^ Fully synchronous, returns only when all the data is fetched.
   | AsyncFetch (IO () -> IO ())
+    -- ^ Asynchronous; performs an arbitrary IO action while the data is
+    -- being fetched, but only returns when all the data is fetched.
+  | FutureFetch (IO (IO ()))
+    -- ^ Returns an IO action that, when performed, waits for the data
+    -- to be received.
+  | FullyAsyncFetch (IO ())
+    -- ^ Fetches the data in the background, calling 'putResult' at
+    -- any time in the future.
 
 -- Why does AsyncFetch contain a `IO () -> IO ()` rather than the
 -- alternative approach of returning the `IO` action to retrieve the
@@ -410,15 +415,8 @@ data PerformFetch
 --
 data BlockedFetch r = forall a. BlockedFetch (r a) (ResultVar a)
 
--- | Function for easily setting a fetch to a particular exception
-setError :: (Exception e) => (forall a. r a -> e) -> BlockedFetch r -> IO ()
-setError e (BlockedFetch req m) = putFailure m (e req)
-
-except :: (Exception e) => e -> Either SomeException a
-except = Left . toException
-
 -- | A sink for the result of a data fetch in 'BlockedFetch'
-newtype ResultVar a = ResultVar (MVar (Either SomeException a))
+newtype ResultVar a = ResultVar (Either SomeException a -> IO ())
 
 -- Why do we need an 'MVar' here?  The reason is that the
 -- cache serves two purposes:
@@ -439,11 +437,8 @@ newtype ResultVar a = ResultVar (MVar (Either SomeException a))
 --     from its 'MVar'. All instances of identical requests will share the same
 --     'MVar' to obtain the result.
 
-newResult :: a -> IO (ResultVar a)
-newResult x = ResultVar <$> newMVar (Right x)
-
-newEmptyResult :: IO (ResultVar a)
-newEmptyResult = ResultVar <$> newEmptyMVar
+newEmptyResult :: (Either SomeException a -> IO ()) -> IO (ResultVar a)
+newEmptyResult = return . ResultVar
 
 putFailure :: (Exception e) => ResultVar a -> e -> IO ()
 putFailure r = putResult r . except
@@ -452,16 +447,14 @@ putSuccess :: ResultVar a -> a -> IO ()
 putSuccess r = putResult r . Right
 
 putResult :: ResultVar a -> Either SomeException a -> IO ()
-putResult (ResultVar var) = putMVar var
+putResult (ResultVar io) res =  io res
 
-takeResult :: ResultVar a -> IO (Either SomeException a)
-takeResult (ResultVar var) = takeMVar var
+-- | Function for easily setting a fetch to a particular exception
+setError :: (Exception e) => (forall a. r a -> e) -> BlockedFetch r -> IO ()
+setError e (BlockedFetch req m) = putFailure m (e req)
 
-tryReadResult :: ResultVar a -> IO (Maybe (Either SomeException a))
-tryReadResult (ResultVar var) = tryReadMVar var
-
-tryTakeResult :: ResultVar a -> IO (Maybe (Either SomeException a))
-tryTakeResult (ResultVar var) = tryTakeMVar var
+except :: (Exception e) => e -> Either SomeException a
+except = Left . toException
 
 -- Fetch templates
 

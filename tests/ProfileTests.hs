@@ -19,7 +19,7 @@ import qualified Data.HashSet as HashSet
 import TestUtils
 
 mkProfilingEnv = do
-  env <- makeTestEnv
+  env <- makeTestEnv False
   return env { flags = (flags env) { report = 4 } }
 
 collectsdata :: Assertion
