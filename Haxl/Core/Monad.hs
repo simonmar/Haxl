@@ -7,9 +7,9 @@
 
 {- TODO
 
-- timing for FullyAsyncFetch
+- fetch stats for FullyAsyncFetch
+- fetch failure stats
 - do EVENTLOG stuff, track the data fetch numbers for performFetch
-- dataSourceTimes and dataSourceFailures are wrong
 
 - write different scheduling policies
 -}
@@ -124,8 +124,6 @@ import GHC.Stack
 
 import Unsafe.Coerce
 
--- import Debug.Trace
-
 #if __GLASGOW_HASKELL__ < 710
 import Data.Int (Int64)
 
@@ -222,11 +220,19 @@ data SchedState u = SchedState
        -- ^ The set of requests that we have not submitted to data sources yet.
        -- Owned by the scheduler.
   , runQueueRef :: {-# UNPACK #-} !(IORef (JobList u))
-                    -- ^ runnable computations
+       -- ^ runnable computations. Things get added to here when we wake up
+       -- a computation that was waiting for something.  When the list is
+       -- empty, either we're finished, or we're waiting for some data fetch
+       -- to return.
   , completions :: {-# UNPACK #-} !(TVar [CompleteReq u])
-       -- ^ Requests that have completed.
-       -- Modified by data sources (via putResult) and the scheduler.
+       -- ^ Requests that have completed.  Modified by data sources
+       -- (via putResult) and the scheduler.  Waiting for this list to
+       -- become non-empty is how the scheduler blocks waiting for
+       -- data fetches to return.
   , pendingWaits :: [IO ()]
+       -- ^ this is a list of IO actions returned by 'FutureFetch'
+       -- data sources.  These do a blocking wait for the results of
+       -- some data fetch.
   }
 
 
@@ -247,6 +253,7 @@ appendJobList (JobCons a b c) d = JobCons a b (appendJobList c d)
 lengthJobList :: JobList u -> Int
 lengthJobList JobNil = 0
 lengthJobList (JobCons _ _ j) = 1 + lengthJobList j
+
 
 -- -----------------------------------------------------------------------------
 -- IVar
@@ -276,7 +283,8 @@ getIVarApply (IVar !ref) a = GenHaxl $ \_env _sref -> do
     IVarFull (Ok f) -> return (Done (f a))
     IVarFull (ThrowHaxl e) -> return (Throw e)
     IVarFull (ThrowIO e) -> throwIO e
-    IVarEmpty _ -> return (Blocked (IVar ref) (Cont (getIVarApply (IVar ref) a)))
+    IVarEmpty _ ->
+      return (Blocked (IVar ref) (Cont (getIVarApply (IVar ref) a)))
 
 getIVar :: IVar u a -> GenHaxl u a
 getIVar (IVar !ref) = GenHaxl $ \_env _sref -> do
@@ -332,7 +340,7 @@ eitherToResult (Left e) = ThrowHaxl e
 
 
 -- -----------------------------------------------------------------------------
--- The Monad
+-- CompleteReq
 
 -- | A completed request from a data source, containing the result,
 -- and the 'IVar' representing the blocked computations.  The job of a
@@ -342,6 +350,10 @@ eitherToResult (Left e) = ThrowHaxl e
 data CompleteReq u =
   forall a . CompleteReq (Either SomeException a)
                          !(IVar u a)  -- IVar because the result is cached
+
+
+-- -----------------------------------------------------------------------------
+-- Result
 
 -- | The result of a computation is either 'Done' with a value, 'Throw'
 -- with an exception, or 'Blocked' on the result of a data fetch with
@@ -356,6 +368,11 @@ data Result u a
          -- we're nested inside multiple '>>=', before finally being
          -- added to the 'ContVar'.  Morally @b -> GenHaxl u a@, but see
          -- 'ContVar',
+
+instance (Show a) => Show (Result u a) where
+  show (Done a) = printf "Done(%s)" $ show a
+  show (Throw e) = printf "Throw(%s)" $ show e
+  show Blocked{} = "Blocked"
 
 {- Note [Exception]
 
@@ -397,6 +414,9 @@ turn it into a Haxl exception:
    doing, and just wrap all exceptions.
 -}
 
+
+-- -----------------------------------------------------------------------------
+-- Cont
 
 data Cont u a
   = Cont (GenHaxl u a)
@@ -440,10 +460,9 @@ toHaxlFmap f (g :<$> x) = toHaxlFmap (f . g) x
 -- tree benchmark (tree 1 is near the leaves). So this rule might just be
 -- optimizing for a microbenchmark.
 
-instance (Show a) => Show (Result u a) where
-  show (Done a) = printf "Done(%s)" $ show a
-  show (Throw e) = printf "Throw(%s)" $ show e
-  show Blocked{} = "Blocked"
+
+-- -----------------------------------------------------------------------------
+-- Monad/Applicative instances
 
 instance Monad (GenHaxl u) where
   return a = GenHaxl $ \_env _ref -> return (Done a)
@@ -520,14 +539,18 @@ instance Applicative (GenHaxl u) where
 --
 -- The first was slightly faster according to tests/MonadBench.hs.
 
-{-
+
+-- -----------------------------------------------------------------------------
+-- runHaxl
+
+{- TODO: later
 data SchedPolicy
   = SubmitImmediately
   | WaitAtLeast Int{-ms-}
   | WaitForAllPendingRequests
 -}
 
--- | Runs a 'Haxl' computation in an 'Env'.
+-- | Runs a 'Haxl' computation in the given 'Env'.
 runHaxl :: forall u a. Env u -> GenHaxl u a -> IO a
 runHaxl env@Env{flags=flags} haxl = do
   result@(IVar resultRef) <- newIVar -- where to put the final result
@@ -541,7 +564,7 @@ runHaxl env@Env{flags=flags} haxl = do
            , completions = comps
            , pendingWaits = [] }
 
-    -- Run the next job on the JobList
+    -- Run the next job on the JobList, and put its result in the given IVar
     schedule :: SchedState u -> JobList u -> GenHaxl u b -> IVar u b -> IO ()
     schedule st@SchedState{..} rq (GenHaxl run) (IVar !ref) = do
       ifTrace flags 3 $ printf "schedule: %d\n" (1 + lengthJobList rq)
@@ -552,7 +575,10 @@ runHaxl env@Env{flags=flags} haxl = do
               IVarFull _ -> error "multiple put"
               IVarEmpty haxls -> do
                 writeIORef ref (IVarFull r)
+                -- Have we got the final result now?
                 if ref == unsafeCoerce resultRef
+                        -- comparing IORefs of different types is safe, it's
+                        -- pointer-equality on the MutVar#.
                    then return ()
                    else reschedule st (appendJobList haxls rq)
       r <- Exception.try $ run env st
@@ -566,6 +592,21 @@ runHaxl env@Env{flags=flags} haxl = do
           addJob (toHaxl fn) (IVar ref) ivar
           reschedule st rq
   
+    -- Here we have a choice:
+    --   - If the requestStore is non-empty, we could submit those
+    --     requests right away without waiting for more.  This might
+    --     be good for latency, especially if the data source doesn't
+    --     support batching, or if batching is pessmial.
+    --   - To optimise the batch sizes, we want to execute as much as
+    --     we can and only submit requests when we have no more
+    --     computation to do.
+    --   - compromise: wait at least Nms for an outstanding result
+    --     before giving up and submitting new requests.
+    --
+    -- For now we use the batching strategy in the scheduler, but
+    -- individual data sources can request that their requests are
+    -- sent eagerly by using schedulerHint.
+    --
     reschedule :: SchedState u -> JobList u -> IO ()
     reschedule q@SchedState{..} haxls = do
       case haxls of
@@ -579,13 +620,6 @@ runHaxl env@Env{flags=flags} haxl = do
         JobCons a b c ->
           schedule q c a b
   
-    -- Here we have a choice:
-    --   - for latency: submit requests as soon as we have them
-    --   - for batching: wait until all outstanding requests have finished
-    --     before submitting the next batch.  We can still begin running
-    --     as soon as we have results.
-    --   - compromise: wait at least Nms for an outstanding result
-    --     before giving up and submitting new requests.
     emptyRunQueue :: SchedState u -> IO ()
     emptyRunQueue q@SchedState{..} = do
       ifTrace flags 3 $ printf "emptyRunQueue\n"
@@ -607,7 +641,7 @@ runHaxl env@Env{flags=flags} haxl = do
         then waitCompletions q
         else do
           writeIORef reqStoreRef noRequests
-          (_, waits) <- performRequestStore 0 env reqStore -- latency optimised
+          (_, waits) <- performRequestStore 0 env reqStore
           ifTrace flags 3 $ printf "performFetches: %d waits\n" (length waits)
           -- empty the cache if we're not caching.  Is this the best
           -- place to do it?  We do get to de-duplicate requests that
@@ -663,6 +697,9 @@ runHaxl env@Env{flags=flags} haxl = do
     IVarFull (ThrowIO e)  -> throwIO e
 
 
+-- -----------------------------------------------------------------------------
+-- Env utils
+
 -- | Extracts data from the 'Env'.
 env :: (Env u -> a) -> GenHaxl u a
 env f = GenHaxl $ \env _ref -> return (Done (f env))
@@ -678,6 +715,9 @@ withEnv newEnv (GenHaxl m) = GenHaxl $ \_env ref -> do
     Blocked ivar k ->
       return (Blocked ivar (Cont (withEnv newEnv (toHaxl k))))
 
+
+-- -----------------------------------------------------------------------------
+-- Profiling
 
 -- | Label a computation so profiling data is attributed to the label.
 withLabel :: ProfileLabel -> GenHaxl u a -> GenHaxl u a
@@ -745,6 +785,7 @@ incrementMemoHitCounterFor lbl p =
 incrementMemoHitCounter :: ProfileData -> ProfileData
 incrementMemoHitCounter pd = pd { profileMemoHits = succ (profileMemoHits pd) }
 
+
 -- -----------------------------------------------------------------------------
 -- Exceptions
 
@@ -790,6 +831,7 @@ try haxl = (Right <$> haxl) `catch` (return . Left)
 instance Catch.MonadThrow (GenHaxl u) where throwM = Haxl.Core.Monad.throw
 -- | @since 0.3.1.0
 instance Catch.MonadCatch (GenHaxl u) where catch = Haxl.Core.Monad.catch
+
 
 -- -----------------------------------------------------------------------------
 -- Unsafe operations
@@ -977,6 +1019,7 @@ addProfileFetch env req = do
   -- So we do not count the allocation overhead of addProfileFetch
   setAllocationCounter c
 
+
 -- | A data request that is not cached.  This is not what you want for
 -- normal read requests, because then multiple identical requests may
 -- return different results, and this invalidates some of the
@@ -997,6 +1040,7 @@ uncachedRequest req = GenHaxl $ \_env SchedState{..} -> do
   modifyIORef' reqStoreRef $ \bs ->
     addRequest (BlockedFetch req (mkResultVar done)) bs
   return $ Blocked cr (Cont (getIVar cr))
+
 
 -- | Transparently provides caching. Useful for datasources that can
 -- return immediately, but also caches values.  Exceptions thrown by
@@ -1191,27 +1235,6 @@ wrapFetchInCatch reqs fetch =
     forceError e (BlockedFetch _ rvar) =
       putResult rvar (except e)
 
-{-
-- can't wrap fetch, doesn't work for future fetch / fully async
-- have to wrap jobs, but now we can't do batches
-
-SyncFetch:
-  - easy
-  - can report time for batch
-AsyncFetch:
-  - start clock when we submit, stop clock when we have the result
-  - can report time for batch
-FutureFetch:
-  - start clock when we submit, stop clock when we have the result
-    (wrap the future we get back)
-  - can report time for batch
-FullyAsyncFetch:
-  - start clock when we submit
-  - putResultVar must report the fetch time
-  - cannot report time for the batch
-  - so we must modify the ResultVar
--}
-
 
 wrapFetchInStats
   :: IORef Stats
@@ -1243,6 +1266,8 @@ wrapFetchInStats !statsRef dataSource batchSize perform = do
            updateFetchStats (submitTime + waitTime) (submitAlloc + waitAlloc)
     FullyAsyncFetch io ->
        FullyAsyncFetch io
+          -- TODO: we will have to wrap the ResultVars, but we need to know
+          -- beforehand that this datasource will return a FullyAsyncFetch
   where
     statsForIO io = do
       prevAlloc <- getAllocationCounter

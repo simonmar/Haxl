@@ -269,12 +269,10 @@ emptyProfileData = ProfileData 0 HashSet.empty Map.empty 0
 -- ---------------------------------------------------------------------------
 -- DataCache
 
--- | The 'DataCache' maps things of type @f a@ to @'ResultVar' a@, for
--- any @f@ and @a@ provided @f a@ is an instance of 'Typeable'. In
--- practice @f a@ will be a request type parameterised by its result.
+-- | A @'DataCache' res@ maps things of type @req a@ to @res a@, for
+-- any @req@ and @a@ provided @req a@ is an instance of 'Typeable'. In
+-- practice @req a@ will be a request type parameterised by its result.
 --
--- See the definition of 'ResultVar' for more details.
-
 newtype DataCache res = DataCache (HashMap TypeRep (SubCache res))
 
 -- | The implementation is a two-level map: the outer level maps the
@@ -282,6 +280,7 @@ newtype DataCache res = DataCache (HashMap TypeRep (SubCache res))
 -- results.  So each 'SubCache' contains requests of the same type.
 -- This works well because we only have to store the dictionaries for
 -- 'Hashable' and 'Eq' once per request type.
+--
 data SubCache res =
   forall req a . (Hashable (req a), Eq (req a), Typeable (req a)) =>
        SubCache (req a -> String) (a -> String) ! (HashMap (req a) (res a))
@@ -326,17 +325,6 @@ class (DataSourceName req, StateKey req, ShowP req) => DataSource u req where
   schedulerHint :: u -> SchedulerHint req
   schedulerHint _ = TryToBatch
 
--- | Hints to the scheduler about this data source
-data SchedulerHint (req :: * -> *)
-  = TryToBatch
-    -- ^ Hold data-source requests while we execute as much as we can, so
-    -- that we can hopefully collect more requests to batch.
-  | SubmitImmediately
-    -- ^ Submit a request via fetch as soon as we have one, don't try to
-    -- batch multiple requests.  This is really only useful if the data source
-    -- returns FullyAsyncFetch, otherwise requests to this data source will
-    -- be performed synchronously, one at a time.
-
 class DataSourceName req where
   -- | The name of this 'DataSource', used in tracing and stats. Must
   -- take a dummy request.
@@ -357,38 +345,46 @@ type Request req a =
   , Show a
   )
 
--- | A data source can fetch data in one of two ways.
---
---   * Synchronously ('SyncFetch'): the fetching operation is an
---     @'IO' ()@ that fetches all the data and then returns.
---
---   * Asynchronously ('AsyncFetch'): we can do something else while the
---     data is being fetched. The fetching operation takes an @'IO' ()@ as
---     an argument, which is the operation to perform while the data is
---     being fetched.
---
--- See 'syncFetch' and 'asyncFetch' for example usage.
+-- | Hints to the scheduler about this data source
+data SchedulerHint (req :: * -> *)
+  = TryToBatch
+    -- ^ Hold data-source requests while we execute as much as we can, so
+    -- that we can hopefully collect more requests to batch.
+  | SubmitImmediately
+    -- ^ Submit a request via fetch as soon as we have one, don't try to
+    -- batch multiple requests.  This is really only useful if the data source
+    -- returns FullyAsyncFetch, otherwise requests to this data source will
+    -- be performed synchronously, one at a time.
+
+-- | A data source can fetch data in one of four ways.
 --
 data PerformFetch
   = SyncFetch  (IO ())
     -- ^ Fully synchronous, returns only when all the data is fetched.
+    -- See 'syncFetch' for an example.
   | AsyncFetch (IO () -> IO ())
-    -- ^ Asynchronous; performs an arbitrary IO action while the data is
-    -- being fetched, but only returns when all the data is fetched.
-  | FutureFetch (IO (IO ()))
-    -- ^ Returns an IO action that, when performed, waits for the data
-    -- to be received.
+    -- ^ Asynchronous; performs an arbitrary IO action while the data
+    -- is being fetched, but only returns when all the data is
+    -- fetched.  See 'asyncFetch' for an example.
   | FullyAsyncFetch (IO ())
     -- ^ Fetches the data in the background, calling 'putResult' at
-    -- any time in the future.
+    -- any time in the future.  This is the best kind of fetch,
+    -- because it provides the most concurrency.
+  | FutureFetch (IO (IO ()))
+    -- ^ Returns an IO action that, when performed, waits for the data
+    -- to be received.  This is the second-best type of fetch, because
+    -- the scheduler still has to perform the blocking wait at some
+    -- point in the future, and when it has multiple blocking waits to
+    -- perform, it can't know which one will return first.
+    --
+    -- Why not just forkIO the IO action to make a FutureFetch into a
+    -- FullyAsyncFetch?  The blocking wait will probably do a safe FFI
+    -- call, which means it needs its own OS thread.  If we don't want
+    -- to create an arbitrary number of OS threads, then FutureFetch
+    -- enables all the blocking waits to be done on a single thread.
+    -- Also, you might have a data source that requires all calls to
+    -- be made in the same OS thread.
 
--- Why does AsyncFetch contain a `IO () -> IO ()` rather than the
--- alternative approach of returning the `IO` action to retrieve the
--- results, which might seem better: `IO (IO ())`?  The point is that
--- this allows the data source to acquire resources for the purpose of
--- this fetching round using the standard `bracket` pattern, so it can
--- ensure that the resources acquired are properly released even if
--- other data sources fail.
 
 -- | A 'BlockedFetch' is a pair of
 --
@@ -409,27 +405,12 @@ data PerformFetch
 --
 data BlockedFetch r = forall a. BlockedFetch (r a) (ResultVar a)
 
+
+-- -----------------------------------------------------------------------------
+-- ResultVar
+
 -- | A sink for the result of a data fetch in 'BlockedFetch'
 newtype ResultVar a = ResultVar (Either SomeException a -> IO ())
-
--- Why do we need an 'MVar' here?  The reason is that the
--- cache serves two purposes:
---
---  1. To cache the results of requests that were submitted in a previous round.
---
---  2. To remember requests that have been encountered in the current round but
---     are not yet submitted, so that if we see the request again we can make
---     sure that we only submit it once.
---
--- Storing the result as an 'MVar' gives two benefits:
---
---   * We can tell the difference between (1) and (2) by testing whether the
---     'MVar' is empty. See 'Haxl.Fetch.cached'.
---
---   * In the case of (2), we don't have to update the cache again after the
---     current round, and after the round we can read the result of each request
---     from its 'MVar'. All instances of identical requests will share the same
---     'MVar' to obtain the result.
 
 mkResultVar :: (Either SomeException a -> IO ()) -> ResultVar a
 mkResultVar = ResultVar
@@ -450,6 +431,8 @@ setError e (BlockedFetch req m) = putFailure m (e req)
 except :: (Exception e) => e -> Either SomeException a
 except = Left . toException
 
+
+-- -----------------------------------------------------------------------------
 -- Fetch templates
 
 stubFetch
