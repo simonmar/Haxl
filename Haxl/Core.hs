@@ -27,7 +27,7 @@ module Haxl.Core (
   -- ** Data fetching and caching
   dataFetch, uncachedRequest,
   cacheRequest, cacheResult, cachedComputation,
---  dumpCacheAsHaskell,
+  dumpCacheAsHaskell,
 
   -- ** Memoization
   memo, memoize, memoize1, memoize2,
@@ -74,7 +74,7 @@ module Haxl.Core (
 
   -- ** Result variables
   ResultVar(..),
-  newEmptyResult,
+  mkResultVar,
   putFailure,
   putResult,
   putSuccess,

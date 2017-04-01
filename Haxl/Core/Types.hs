@@ -70,7 +70,7 @@ module Haxl.Core.Types (
 
   -- * Result variables
   ResultVar(..),
-  newEmptyResult,
+  mkResultVar,
   putFailure,
   putResult,
   putSuccess,
@@ -89,7 +89,6 @@ module Haxl.Core.Types (
 #if __GLASGOW_HASKELL__ < 710
 import Control.Applicative
 #endif
-import Control.Concurrent.MVar
 import Control.Exception
 import Control.Monad
 import Data.Aeson
@@ -437,8 +436,8 @@ newtype ResultVar a = ResultVar (Either SomeException a -> IO ())
 --     from its 'MVar'. All instances of identical requests will share the same
 --     'MVar' to obtain the result.
 
-newEmptyResult :: (Either SomeException a -> IO ()) -> IO (ResultVar a)
-newEmptyResult = return . ResultVar
+mkResultVar :: (Either SomeException a -> IO ()) -> ResultVar a
+mkResultVar = ResultVar
 
 putFailure :: (Exception e) => ResultVar a -> e -> IO ()
 putFailure r = putResult r . except

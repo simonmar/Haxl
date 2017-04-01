@@ -55,7 +55,7 @@ module Haxl.Core.Monad (
     -- * Data fetching and caching
     ShowReq, dataFetch, dataFetchWithShow, uncachedRequest, cacheRequest,
     cacheResult, cacheResultWithShow, cachedComputation,
-    -- dumpCacheAsHaskell, dumpCacheAsHaskellFn,
+    dumpCacheAsHaskell, dumpCacheAsHaskellFn,
 
     -- * Memoization Machinery
     newMemo, newMemoWith, prepareMemo, runMemo,
@@ -110,6 +110,7 @@ import qualified Data.Map as Map
 import Data.Monoid
 import Data.Time
 import Data.Typeable
+import Text.PrettyPrint hiding ((<>))
 import Text.Printf
 #ifdef EVENTLOG
 import Control.Exception (bracket_)
@@ -867,10 +868,9 @@ cachedWithInsert showFn insertFn env SchedState{..} req = do
       let done r = atomically $ do
             cs <- readTVar completions
             writeTVar completions (CompleteReq r ivar : cs)
-      rvar <- newEmptyResult done
       writeIORef (cacheRef env) $! insertFn req ivar cache
       modifyIORef' numRequests (+1)
-      return (Uncached rvar ivar)
+      return (Uncached (mkResultVar done) ivar)
   case DataCache.lookup req cache of
     Nothing -> doFetch
     Just (IVar cr) -> do
@@ -983,7 +983,6 @@ uncachedRequest req = GenHaxl $ \_env SchedState{..} -> do
   let done r = atomically $ do
         cs <- readTVar completions
         writeTVar completions (CompleteReq r cr : cs)
-  rvar <- newEmptyResult done
   modifyIORef' numRequests (+1)
   return $ Blocked cr (Cont (getIVar cr))
 
@@ -1299,7 +1298,6 @@ cachedComputation req haxl = GenHaxl $ \env ref@SchedState{..} -> do
 
 -- -----------------------------------------------------------------------------
 
-{-
 -- | Dump the contents of the cache as Haskell code that, when
 -- compiled and run, will recreate the same cache contents.  For
 -- example, the generated code looks something like this:
@@ -1320,19 +1318,29 @@ dumpCacheAsHaskellFn :: String -> String -> GenHaxl u String
 dumpCacheAsHaskellFn fnName fnType = do
   ref <- env cacheRef  -- NB. cacheRef, not memoRef.  We ignore memoized
                        -- results when dumping the cache.
-  entries <- unsafeLiftIO $ readIORef ref >>= showCache
   let
+    readIVar (IVar ref) = do
+      r <- readIORef ref
+      case r of
+        IVarFull (Ok a) -> return (Just (Right a))
+        IVarFull (ThrowHaxl e) -> return (Just (Left e))
+        IVarFull (ThrowIO e) -> return (Just (Left e))
+        IVarEmpty _ -> return Nothing
+
     mk_cr (req, res) =
       text "cacheRequest" <+> parens (text req) <+> parens (result res)
     result (Left e) = text "except" <+> parens (text (show e))
     result (Right s) = text "Right" <+> parens (text s)
+
+  entries <- unsafeLiftIO $ do
+    cache <- readIORef ref
+    showCache cache readIVar
 
   return $ show $
     text (fnName ++ " :: " ++ fnType) $$
     text (fnName ++ " = do") $$
       nest 2 (vcat (map mk_cr (concatMap snd entries))) $$
     text "" -- final newline
--}
 
 -- -----------------------------------------------------------------------------
 -- Memoization

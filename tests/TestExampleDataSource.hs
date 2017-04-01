@@ -33,8 +33,8 @@ tests = TestList [
   TestLabel "preCacheTest" preCacheTest,
   TestLabel "cachedComputationTest" cachedComputationTest,
   TestLabel "memoTest" memoTest,
-  TestLabel "dataSourceExceptionTest" dataSourceExceptionTest
---  TestLabel "dumpCacheAsHaskell" dumpCacheTest
+  TestLabel "dataSourceExceptionTest" dataSourceExceptionTest,
+  TestLabel "dumpCacheAsHaskell" dumpCacheTest
   ]
 
 -- Let's test ExampleDataSource.
@@ -169,7 +169,6 @@ dataSourceExceptionTest = TestCase $ do
        Left ThreadKilled -> True
        _ -> False
 
-{-
 -- Test that we can load the cache from a dumped copy of it, and then dump it
 -- again to get the same result.
 dumpCacheTest = TestCase $ do
@@ -180,4 +179,3 @@ dumpCacheTest = TestCase $ do
   -- The order of 'cacheRequest ...' calls is nondeterministic and
   -- differs among GHC versions, so we sort the lines for comparison.
   assertEqual "dumpCacheAsHaskell" (sort $ lines loadcache) (sort $ lines str)
--}
