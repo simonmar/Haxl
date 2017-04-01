@@ -121,7 +121,7 @@ import Debug.Trace (traceEventIO)
 import GHC.Stack
 #endif
 
-import Debug.Trace
+-- import Debug.Trace
 
 #if __GLASGOW_HASKELL__ < 710
 import Data.Int (Int64)
@@ -196,8 +196,9 @@ emptyEnv = initEnv stateEmpty
 -- -----------------------------------------------------------------------------
 -- | The Haxl monad, which does several things:
 --
---  * It is a reader monad for 'Env' and 'IORef' 'RequestStore', The
---    latter is the current batch of unsubmitted data fetch requests.
+--  * It is a reader monad for 'Env' and 'SchedState', The
+--    latter is the current state of the scheduler, including
+--    unfetched requests and the run queue of computations.
 --
 --  * It is a concurrency, or resumption, monad. A computation may run
 --    partially and return 'Blocked', in which case the framework should
@@ -270,7 +271,7 @@ newFullIVar :: ResultVal a -> IO (IVar u a)
 newFullIVar r = IVar <$> newIORef (IVarFull r)
 
 getIVarApply :: IVar u (a -> b) -> a -> GenHaxl u b
-getIVarApply (IVar !ref) a = GenHaxl $ \env sref -> do
+getIVarApply (IVar !ref) a = GenHaxl $ \_env _sref -> do
   e <- readIORef ref
   case e of
     IVarFull (Ok f) -> return (Done (f a))
@@ -279,7 +280,7 @@ getIVarApply (IVar !ref) a = GenHaxl $ \env sref -> do
     IVarEmpty _ -> return (Blocked (IVar ref) (Cont (getIVarApply (IVar ref) a)))
 
 getIVar :: IVar u a -> GenHaxl u a
-getIVar (IVar !ref) = GenHaxl $ \env sref -> do
+getIVar (IVar !ref) = GenHaxl $ \_env _sref -> do
   e <- readIORef ref
   case e of
     IVarFull (Ok a) -> return (Done a)
@@ -304,6 +305,7 @@ addJob !haxl !resultIVar (IVar !ref) =
       IVarEmpty list -> IVarEmpty ((JobCons haxl) resultIVar list)
       _ -> addJobPanic
 
+addJobPanic :: forall a . a
 addJobPanic = error "addJob: not empty"
 
 -- -----------------------------------------------------------------------------
@@ -481,7 +483,7 @@ instance Applicative (GenHaxl u) where
           Blocked ivar fcont -> trace_ "Done/Blocked" $
             return (Blocked ivar (f :<$> fcont))
       Throw e -> trace_ "Throw" $ return (Throw e)
-      Blocked ivar1@(IVar ref) fcont -> do
+      Blocked ivar1 fcont -> do
          ra <- aa env st
          case ra of
            Done a -> trace_ "Blocked/Done" $
@@ -519,15 +521,16 @@ instance Applicative (GenHaxl u) where
 --
 -- The first was slightly faster according to tests/MonadBench.hs.
 
+{-
 data SchedPolicy
   = SubmitImmediately
   | WaitAtLeast Int{-ms-}
   | WaitForAllPendingRequests
-
+-}
 
 -- | Runs a 'Haxl' computation in an 'Env'.
 runHaxl :: forall u a. Env u -> GenHaxl u a -> IO a
-runHaxl env haxl = do
+runHaxl env@Env{flags=flags} haxl = do
   result@(IVar resultRef) <- newIVar -- where to put the final result
   rs <- newIORef noRequests          -- RequestStore
   nr <- newIORef 0                   -- numRequests
@@ -550,7 +553,7 @@ runHaxl env haxl = do
   -- Run the next job on the JobList
   schedule :: SchedState u -> JobList u -> GenHaxl u b -> IVar u b -> IO ()
   schedule st@SchedState{..} rq (GenHaxl run) (IVar !ref) = do
---    printf "schedule: %d\n" (1 + lengthJobList rq)
+    ifTrace flags 3 $ printf "schedule: %d\n" (1 + lengthJobList rq)
     let {-# INLINE result #-}
         result r = do
           e <- readIORef ref
@@ -580,8 +583,8 @@ runHaxl env haxl = do
           JobCons a b c -> do
             writeIORef runQueueRef JobNil
             schedule q c a b
-      JobCons a b c -> do
-       schedule q c a b
+      JobCons a b c ->
+        schedule q c a b
 
   -- Here we have a choice:
   --   - for latency: submit requests as soon as we have them
@@ -592,14 +595,14 @@ runHaxl env haxl = do
   --     before giving up and submitting new requests.
   emptyRunQueue :: SchedState u -> IO ()
   emptyRunQueue q@SchedState{..} = do
---    printf "emptyRunQueue\n"
+    ifTrace flags 3 $ printf "emptyRunQueue\n"
     haxls <- checkCompletions q
     case haxls of
       JobNil -> do
         case pendingWaits of
           [] -> checkRequestStore q
           wait:waits -> do
---            printf "invoking wait\n"
+            ifTrace flags 3 $ printf "invoking wait\n"
             wait
             emptyRunQueue q { pendingWaits = waits } -- check completions
       _ -> reschedule q haxls
@@ -611,18 +614,18 @@ runHaxl env haxl = do
       then waitCompletions q
       else do
         writeIORef reqStoreRef noRequests
-        (_, waits) <- performFetches 0 env reqStore -- latency optimised
---        printf "performFetches: %d waits\n" (length waits)
+        (_, waits) <- performRequestStore 0 env reqStore -- latency optimised
+        ifTrace flags 3 $ printf "performFetches: %d waits\n" (length waits)
         -- empty the cache if we're not caching.  Is this the best
         -- place to do it?  We do get to de-duplicate requests that
         -- happen simultaneously.
-        when (caching (flags env) == 0) $
+        when (caching flags == 0) $
           writeIORef (cacheRef env) emptyDataCache
         emptyRunQueue q{ pendingWaits = waits ++ pendingWaits }
 
   checkCompletions :: SchedState u -> IO (JobList u)
-  checkCompletions q@SchedState{..} = do
---    printf "checkCompletions\n"
+  checkCompletions SchedState{..} = do
+    ifTrace flags 3 $ printf "checkCompletions\n"
     comps <- atomically $ do
       c <- readTVar completions
       writeTVar completions []
@@ -630,12 +633,12 @@ runHaxl env haxl = do
     case comps of
       [] -> return JobNil
       _ -> do
---        printf "%d complete\n" (length comps)
+        ifTrace flags 3 $ printf "%d complete\n" (length comps)
         let getComplete (CompleteReq a (IVar cr)) = do
               r <- readIORef cr
               case r of
                 IVarFull _ -> do
---                  printf "existing result\n"
+                  ifTrace flags 3 $ printf "existing result\n"
                   return JobNil
                   -- this happens if a data source reports a result,
                   -- and then throws an exception.  We call putResult
@@ -653,7 +656,7 @@ runHaxl env haxl = do
   waitCompletions :: SchedState u -> IO ()
   waitCompletions q@SchedState{..} = do
     n <- readIORef numRequests
---    printf "waitCompletions: %d\n" n
+    ifTrace flags 3 $ printf "waitCompletions: %d\n" n
     if n == 0
        then return ()
        else do
@@ -838,10 +841,6 @@ data CacheResult u a
   | Cached (ResultVal a)
 
 
--- | Checks the data cache for the result of a request.
-cached :: (Request r a) => Env u -> SchedState u -> r a -> IO (CacheResult u a)
-cached = cachedWithInsert show DataCache.insert
-
 -- | Show functions for request and its result.
 type ShowReq r a = (r a -> String, a -> String)
 
@@ -913,7 +912,8 @@ dataFetchWithShow (showReq, showRes) = dataFetchWithInsert showReq
 -- | Performs actual fetching of data for a 'Request' from a 'DataSource', using
 -- the given function to insert requests in the cache.
 dataFetchWithInsert
-  :: (DataSource u r, Eq (r a), Hashable (r a), Typeable (r a))
+  :: forall u r a
+   . (DataSource u r, Eq (r a), Hashable (r a), Typeable (r a))
   => (r a -> String)    -- See Note [showFn]
   -> (r a -> IVar u a -> DataCache (IVar u) -> DataCache (IVar u))
   -> r a
@@ -923,11 +923,18 @@ dataFetchWithInsert showFn insertFn req = GenHaxl $ \env st@SchedState{..} -> do
   res <- cachedWithInsert showFn insertFn env st req
   ifProfiling (flags env) $ addProfileFetch env req
   case res of
-    -- Not seen before: add the request to the RequestStore, so it
-    -- will be fetched in the next round.
+    -- Not seen before:
     Uncached rvar ivar -> do
       logFetch env showFn req
-      modifyIORef' reqStoreRef $ \bs -> addRequest (BlockedFetch req rvar) bs
+      case schedulerHint (userEnv env) :: SchedulerHint r of
+        SubmitImmediately -> do
+          (_,ios) <- performFetches 0 env
+            [BlockedFetches [BlockedFetch req rvar]]
+          sequence_ ios
+        TryToBatch ->
+          -- add the request to the RequestStore and continue
+      modifyIORef' reqStoreRef $ \bs ->
+            addRequest (BlockedFetch req rvar) bs
       return $ Blocked ivar (Cont (getIVar ivar))
 
     -- Seen before but not fetched yet.  We're blocked, but we don't have
@@ -983,6 +990,8 @@ uncachedRequest req = GenHaxl $ \_env SchedState{..} -> do
   let done r = atomically $ do
         cs <- readTVar completions
         writeTVar completions (CompleteReq r cr : cs)
+  modifyIORef' reqStoreRef $ \bs ->
+    addRequest (BlockedFetch req (mkResultVar done)) bs
   modifyIORef' numRequests (+1)
   return $ Blocked cr (Cont (getIVar cr))
 
@@ -1071,14 +1080,19 @@ cacheRequest request result = GenHaxl $ \env _st -> do
 instance IsString a => IsString (GenHaxl u a) where
   fromString s = return (fromString s)
 
+performRequestStore
+   :: forall u. Int -> Env u -> RequestStore u -> IO (Int, [IO ()])
+performRequestStore n env reqStore =
+  performFetches n env (contents reqStore)
+
 -- | Issues a batch of fetches in a 'RequestStore'. After
 -- 'performFetches', all the requests in the 'RequestStore' are
 -- complete, and all of the 'ResultVar's are full.
-performFetches :: forall u. Int -> Env u -> RequestStore u -> IO (Int, [IO ()])
-performFetches n env reqs = do
+performFetches
+  :: forall u. Int -> Env u -> [BlockedFetches u] -> IO (Int, [IO ()])
+performFetches n env jobs = do
   let f = flags env
       sref = statsRef env
-      jobs = contents reqs
       !n' = n + length jobs
 
   t0 <- getCurrentTime
@@ -1235,7 +1249,7 @@ wrapFetchInTrace i n dsName f =
 wrapFetchInTrace _ _ _ f = f
 #endif
 
-time :: IO a -> IO Microseconds
+time :: IO () -> IO Microseconds
 time io = do
   t0 <- getCurrentTime
   io
@@ -1422,7 +1436,7 @@ newMemoWith memoCmp = do
 -- >   return (a + b)
 --
 runMemo :: MemoVar u a -> GenHaxl u a
-runMemo memoVar@(MemoVar memoRef) = GenHaxl $ \env st -> do
+runMemo (MemoVar memoRef) = GenHaxl $ \env st -> do
   stored <- readIORef memoRef
   case stored of
     -- Memo was not prepared first; throw an exception.

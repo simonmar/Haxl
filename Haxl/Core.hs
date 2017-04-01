@@ -71,6 +71,7 @@ module Haxl.Core (
   BlockedFetch(..),
   PerformFetch(..),
   StateKey(..),
+  SchedulerHint(..),
 
   -- ** Result variables
   ResultVar(..),

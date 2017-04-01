@@ -31,11 +31,10 @@ testEnv = do
 useless :: String -> GenHaxl u Bool
 useless _ = throw (NotFound "ha ha")
 
-en = error "no env"
-
 exceptions :: Assertion
 exceptions =
   do
+    en <- emptyEnv ()
     a <- runHaxl en $ try (useless "input")
     assertBool "NotFound -> HaxlException" $
       isLeft (a :: Either HaxlException Bool)
@@ -125,7 +124,9 @@ exceptions =
 -- This is mostly a compile test, to make sure all the plumbing
 -- makes the compiler happy.
 base :: (Exception a) => a -> IO HaxlException
-base e = runHaxl en $ throw e `catch` \x -> return x
+base e = do
+  en <- emptyEnv ()
+  runHaxl en $ throw e `catch` \x -> return x
 
 printing :: Assertion
 printing = do

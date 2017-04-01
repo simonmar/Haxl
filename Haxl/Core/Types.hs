@@ -62,6 +62,7 @@ module Haxl.Core.Types (
   Request,
   BlockedFetch(..),
   PerformFetch(..),
+  SchedulerHint(..),
 
   -- * DataCache
   DataCache(..),
@@ -341,6 +342,20 @@ class (DataSourceName req, StateKey req, ShowP req) => DataSource u req where
       -- ^ Requests to fetch.
     -> PerformFetch
       -- ^ Fetch the data; see 'PerformFetch'.
+
+  schedulerHint :: u -> SchedulerHint req
+  schedulerHint _ = TryToBatch
+
+-- | Hints to the scheduler about this data source
+data SchedulerHint (req :: * -> *)
+  = TryToBatch
+    -- ^ Hold data-source requests while we execute as much as we can, so
+    -- that we can hopefully collect more requests to batch.
+  | SubmitImmediately
+    -- ^ Submit a request via fetch as soon as we have one, don't try to
+    -- batch multiple requests.  This is really only useful if the data source
+    -- returns FullyAsyncFetch, otherwise requests to this data source will
+    -- be performed synchronously, one at a time.
 
 class DataSourceName req where
   -- | The name of this 'DataSource', used in tracing and stats. Must
