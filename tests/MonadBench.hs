@@ -118,7 +118,7 @@ main = do
         ]
       exitWith (ExitFailure 1)
   t1 <- getCurrentTime
-  printf "%10s: %-10d reqs: %.2fs\n"
+  printf "%10s: %10d reqs: %.2fs\n"
     test n (realToFrac (t1 `diffUTCTime` t0) :: Double)
  where
   -- can't use >>, it is aliased to *> and we want the real bind here

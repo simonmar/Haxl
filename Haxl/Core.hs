@@ -38,15 +38,13 @@ module Haxl.Core (
 
   -- ** Statistics
   Stats(..),
-  RoundStats(..),
-  DataSourceRoundStats(..),
+  FetchStats(..),
   Microseconds,
   emptyStats,
   numRounds,
   numFetches,
   ppStats,
-  ppRoundStats,
-  ppDataSourceRoundStats,
+  ppFetchStats,
   Profile,
   emptyProfile,
   profile,

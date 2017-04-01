@@ -44,7 +44,8 @@ makeTestEnv :: Bool -> IO (Env UserEnv)
 makeTestEnv future = do
   tao <- MockTAO.initGlobalState future
   let st = stateSet tao stateEmpty
-  initEnv st testinput
+  env <- initEnv st testinput
+  return env { flags = (flags env) { report = 2 } }
 
 expectRoundsWithEnv
   :: (Eq a, Show a) => Int -> a -> Haxl a -> Env UserEnv -> Assertion

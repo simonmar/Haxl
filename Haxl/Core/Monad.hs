@@ -7,7 +7,6 @@
 
 {- TODO
 
-- implement dumpCacheAsHaskell
 - timing for FullyAsyncFetch
 - do EVENTLOG stuff, track the data fetch numbers for performFetch
 - dataSourceTimes and dataSourceFailures are wrong
@@ -80,6 +79,8 @@ import Haxl.Core.DataCache as DataCache
 
 import Control.Arrow (left)
 import Control.Concurrent.STM
+import Data.Int (Int64)
+import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Control.Monad.Catch as Catch
 import Control.Exception (Exception(..), SomeException, throwIO)
@@ -120,6 +121,8 @@ import Debug.Trace (traceEventIO)
 #ifdef PROFILING
 import GHC.Stack
 #endif
+
+import Unsafe.Coerce
 
 -- import Debug.Trace
 
@@ -220,10 +223,6 @@ data SchedState u = SchedState
        -- Owned by the scheduler.
   , runQueueRef :: {-# UNPACK #-} !(IORef (JobList u))
                     -- ^ runnable computations
-  , numRequests :: {-# UNPACK #-} !(IORef Int)
-       -- ^ Number of requests that we have submitted to data sources but
-       -- that have not yet completed.
-       -- Owned by the scheduler.
   , completions :: {-# UNPACK #-} !(TVar [CompleteReq u])
        -- ^ Requests that have completed.
        -- Modified by data sources (via putResult) and the scheduler.
@@ -533,15 +532,128 @@ runHaxl :: forall u a. Env u -> GenHaxl u a -> IO a
 runHaxl env@Env{flags=flags} haxl = do
   result@(IVar resultRef) <- newIVar -- where to put the final result
   rs <- newIORef noRequests          -- RequestStore
-  nr <- newIORef 0                   -- numRequests
   rq <- newIORef JobNil
   comps <- newTVarIO []              -- completion queue
-  let st = SchedState
-             { reqStoreRef = rs
-             , runQueueRef = rq
-             , numRequests = nr
-             , completions = comps
-             , pendingWaits = [] }
+  let
+    st = SchedState
+           { reqStoreRef = rs
+           , runQueueRef = rq
+           , completions = comps
+           , pendingWaits = [] }
+
+    -- Run the next job on the JobList
+    schedule :: SchedState u -> JobList u -> GenHaxl u b -> IVar u b -> IO ()
+    schedule st@SchedState{..} rq (GenHaxl run) (IVar !ref) = do
+      ifTrace flags 3 $ printf "schedule: %d\n" (1 + lengthJobList rq)
+      let {-# INLINE result #-}
+          result r = do
+            e <- readIORef ref
+            case e of
+              IVarFull _ -> error "multiple put"
+              IVarEmpty haxls -> do
+                writeIORef ref (IVarFull r)
+                if ref == unsafeCoerce resultRef
+                   then return ()
+                   else reschedule st (appendJobList haxls rq)
+      r <- Exception.try $ run env st
+      case r of
+        Left e -> do
+          rethrowAsyncExceptions e
+          result (ThrowIO e)
+        Right (Done a) -> result (Ok a)
+        Right (Throw ex) -> result (ThrowHaxl ex)
+        Right (Blocked ivar fn) -> do
+          addJob (toHaxl fn) (IVar ref) ivar
+          reschedule st rq
+  
+    reschedule :: SchedState u -> JobList u -> IO ()
+    reschedule q@SchedState{..} haxls = do
+      case haxls of
+        JobNil -> do
+          rq <- readIORef runQueueRef
+          case rq of
+            JobNil -> emptyRunQueue q
+            JobCons a b c -> do
+              writeIORef runQueueRef JobNil
+              schedule q c a b
+        JobCons a b c ->
+          schedule q c a b
+  
+    -- Here we have a choice:
+    --   - for latency: submit requests as soon as we have them
+    --   - for batching: wait until all outstanding requests have finished
+    --     before submitting the next batch.  We can still begin running
+    --     as soon as we have results.
+    --   - compromise: wait at least Nms for an outstanding result
+    --     before giving up and submitting new requests.
+    emptyRunQueue :: SchedState u -> IO ()
+    emptyRunQueue q@SchedState{..} = do
+      ifTrace flags 3 $ printf "emptyRunQueue\n"
+      haxls <- checkCompletions q
+      case haxls of
+        JobNil -> do
+          case pendingWaits of
+            [] -> checkRequestStore q
+            wait:waits -> do
+              ifTrace flags 3 $ printf "invoking wait\n"
+              wait
+              emptyRunQueue q { pendingWaits = waits } -- check completions
+        _ -> reschedule q haxls
+  
+    checkRequestStore :: SchedState u -> IO ()
+    checkRequestStore q@SchedState{..} = do
+      reqStore <- readIORef reqStoreRef
+      if RequestStore.isEmpty reqStore
+        then waitCompletions q
+        else do
+          writeIORef reqStoreRef noRequests
+          (_, waits) <- performRequestStore 0 env reqStore -- latency optimised
+          ifTrace flags 3 $ printf "performFetches: %d waits\n" (length waits)
+          -- empty the cache if we're not caching.  Is this the best
+          -- place to do it?  We do get to de-duplicate requests that
+          -- happen simultaneously.
+          when (caching flags == 0) $
+            writeIORef (cacheRef env) emptyDataCache
+          emptyRunQueue q{ pendingWaits = waits ++ pendingWaits }
+  
+    checkCompletions :: SchedState u -> IO (JobList u)
+    checkCompletions SchedState{..} = do
+      ifTrace flags 3 $ printf "checkCompletions\n"
+      comps <- atomically $ do
+        c <- readTVar completions
+        writeTVar completions []
+        return c
+      case comps of
+        [] -> return JobNil
+        _ -> do
+          ifTrace flags 3 $ printf "%d complete\n" (length comps)
+          let getComplete (CompleteReq a (IVar cr)) = do
+                r <- readIORef cr
+                case r of
+                  IVarFull _ -> do
+                    ifTrace flags 3 $ printf "existing result\n"
+                    return JobNil
+                    -- this happens if a data source reports a result,
+                    -- and then throws an exception.  We call putResult
+                    -- a second time for the exception, which comes
+                    -- ahead of the original request (because it is
+                    -- pushed on the front of the completions list) and
+                    -- therefore overrides it.
+                  IVarEmpty cv -> do
+                    writeIORef cr (IVarFull (eitherToResult a))
+                    return cv
+          jobs <- mapM getComplete comps
+          return (foldr appendJobList JobNil jobs)
+  
+    waitCompletions :: SchedState u -> IO ()
+    waitCompletions q@SchedState{..} = do
+      ifTrace flags 3 $ printf "waitCompletions\n"
+      atomically $ do
+        c <- readTVar completions
+        when (null c) retry
+      emptyRunQueue q
+
+  --
   schedule st JobNil haxl result
   r <- readIORef resultRef
   case r of
@@ -549,121 +661,7 @@ runHaxl env@Env{flags=flags} haxl = do
     IVarFull (Ok a)  -> return a
     IVarFull (ThrowHaxl e)  -> throwIO e
     IVarFull (ThrowIO e)  -> throwIO e
- where
-  -- Run the next job on the JobList
-  schedule :: SchedState u -> JobList u -> GenHaxl u b -> IVar u b -> IO ()
-  schedule st@SchedState{..} rq (GenHaxl run) (IVar !ref) = do
-    ifTrace flags 3 $ printf "schedule: %d\n" (1 + lengthJobList rq)
-    let {-# INLINE result #-}
-        result r = do
-          e <- readIORef ref
-          case e of
-            IVarFull _ -> error "multiple put"
-            IVarEmpty haxls -> do
-              writeIORef ref (IVarFull r)
-              reschedule st (appendJobList haxls rq)
-    r <- Exception.try $ run env st
-    case r of
-      Left e -> do
-        rethrowAsyncExceptions e
-        result (ThrowIO e)
-      Right (Done a) -> result (Ok a)
-      Right (Throw ex) -> result (ThrowHaxl ex)
-      Right (Blocked ivar fn) -> do
-        addJob (toHaxl fn) (IVar ref) ivar
-        reschedule st rq
 
-  reschedule :: SchedState u -> JobList u -> IO ()
-  reschedule q@SchedState{..} haxls = do
-    case haxls of
-      JobNil -> do
-        rq <- readIORef runQueueRef
-        case rq of
-          JobNil -> emptyRunQueue q
-          JobCons a b c -> do
-            writeIORef runQueueRef JobNil
-            schedule q c a b
-      JobCons a b c ->
-        schedule q c a b
-
-  -- Here we have a choice:
-  --   - for latency: submit requests as soon as we have them
-  --   - for batching: wait until all outstanding requests have finished
-  --     before submitting the next batch.  We can still begin running
-  --     as soon as we have results.
-  --   - compromise: wait at least Nms for an outstanding result
-  --     before giving up and submitting new requests.
-  emptyRunQueue :: SchedState u -> IO ()
-  emptyRunQueue q@SchedState{..} = do
-    ifTrace flags 3 $ printf "emptyRunQueue\n"
-    haxls <- checkCompletions q
-    case haxls of
-      JobNil -> do
-        case pendingWaits of
-          [] -> checkRequestStore q
-          wait:waits -> do
-            ifTrace flags 3 $ printf "invoking wait\n"
-            wait
-            emptyRunQueue q { pendingWaits = waits } -- check completions
-      _ -> reschedule q haxls
-
-  checkRequestStore :: SchedState u -> IO ()
-  checkRequestStore q@SchedState{..} = do
-    reqStore <- readIORef reqStoreRef
-    if RequestStore.isEmpty reqStore
-      then waitCompletions q
-      else do
-        writeIORef reqStoreRef noRequests
-        (_, waits) <- performRequestStore 0 env reqStore -- latency optimised
-        ifTrace flags 3 $ printf "performFetches: %d waits\n" (length waits)
-        -- empty the cache if we're not caching.  Is this the best
-        -- place to do it?  We do get to de-duplicate requests that
-        -- happen simultaneously.
-        when (caching flags == 0) $
-          writeIORef (cacheRef env) emptyDataCache
-        emptyRunQueue q{ pendingWaits = waits ++ pendingWaits }
-
-  checkCompletions :: SchedState u -> IO (JobList u)
-  checkCompletions SchedState{..} = do
-    ifTrace flags 3 $ printf "checkCompletions\n"
-    comps <- atomically $ do
-      c <- readTVar completions
-      writeTVar completions []
-      return c
-    case comps of
-      [] -> return JobNil
-      _ -> do
-        ifTrace flags 3 $ printf "%d complete\n" (length comps)
-        let getComplete (CompleteReq a (IVar cr)) = do
-              r <- readIORef cr
-              case r of
-                IVarFull _ -> do
-                  ifTrace flags 3 $ printf "existing result\n"
-                  return JobNil
-                  -- this happens if a data source reports a result,
-                  -- and then throws an exception.  We call putResult
-                  -- a second time for the exception, which comes
-                  -- ahead of the original request (because it is
-                  -- pushed on the front of the completions list) and
-                  -- therefore overrides it.
-                IVarEmpty cv -> do
-                  writeIORef cr (IVarFull (eitherToResult a))
-                  modifyIORef' numRequests (subtract 1)
-                  return cv
-        jobs <- mapM getComplete comps
-        return (foldr appendJobList JobNil jobs)
-
-  waitCompletions :: SchedState u -> IO ()
-  waitCompletions q@SchedState{..} = do
-    n <- readIORef numRequests
-    ifTrace flags 3 $ printf "waitCompletions: %d\n" n
-    if n == 0
-       then return ()
-       else do
-         atomically $ do
-           c <- readTVar completions
-           when (null c) retry
-         emptyRunQueue q
 
 -- | Extracts data from the 'Env'.
 env :: (Env u -> a) -> GenHaxl u a
@@ -868,7 +866,6 @@ cachedWithInsert showFn insertFn env SchedState{..} req = do
             cs <- readTVar completions
             writeTVar completions (CompleteReq r ivar : cs)
       writeIORef (cacheRef env) $! insertFn req ivar cache
-      modifyIORef' numRequests (+1)
       return (Uncached (mkResultVar done) ivar)
   case DataCache.lookup req cache of
     Nothing -> doFetch
@@ -918,23 +915,30 @@ dataFetchWithInsert
   -> (r a -> IVar u a -> DataCache (IVar u) -> DataCache (IVar u))
   -> r a
   -> GenHaxl u a
-dataFetchWithInsert showFn insertFn req = GenHaxl $ \env st@SchedState{..} -> do
+dataFetchWithInsert showFn insertFn req =
+  GenHaxl $ \env@Env{..} st@SchedState{..} -> do
   -- First, check the cache
   res <- cachedWithInsert showFn insertFn env st req
-  ifProfiling (flags env) $ addProfileFetch env req
+  ifProfiling flags $ addProfileFetch env req
   case res of
-    -- Not seen before:
+    -- This request has not been seen before
     Uncached rvar ivar -> do
       logFetch env showFn req
-      case schedulerHint (userEnv env) :: SchedulerHint r of
+      --
+      -- Check whether the data source wants to submit requests
+      -- eagerly, or batch them up.
+      --
+      case schedulerHint userEnv :: SchedulerHint r of
         SubmitImmediately -> do
           (_,ios) <- performFetches 0 env
             [BlockedFetches [BlockedFetch req rvar]]
-          sequence_ ios
+          when (not (null ios)) $
+            error "bad data source:SubmitImmediately but returns FutureFetch"
         TryToBatch ->
           -- add the request to the RequestStore and continue
-      modifyIORef' reqStoreRef $ \bs ->
+          modifyIORef' reqStoreRef $ \bs ->
             addRequest (BlockedFetch req rvar) bs
+      --
       return $ Blocked ivar (Cont (getIVar ivar))
 
     -- Seen before but not fetched yet.  We're blocked, but we don't have
@@ -992,7 +996,6 @@ uncachedRequest req = GenHaxl $ \_env SchedState{..} -> do
         writeTVar completions (CompleteReq r cr : cs)
   modifyIORef' reqStoreRef $ \bs ->
     addRequest (BlockedFetch req (mkResultVar done)) bs
-  modifyIORef' numRequests (+1)
   return $ Blocked cr (Cont (getIVar cr))
 
 -- | Transparently provides caching. Useful for datasources that can
@@ -1090,13 +1093,10 @@ performRequestStore n env reqStore =
 -- complete, and all of the 'ResultVar's are full.
 performFetches
   :: forall u. Int -> Env u -> [BlockedFetches u] -> IO (Int, [IO ()])
-performFetches n env jobs = do
-  let f = flags env
-      sref = statsRef env
-      !n' = n + length jobs
+performFetches n env@Env{flags=f, statsRef=sref} jobs = do
+  let !n' = n + length jobs
 
   t0 <- getCurrentTime
-  a0 <- getAllocationCounter
 
   let
     roundstats =
@@ -1119,33 +1119,29 @@ performFetches n env jobs = do
     applyFetch (i, BlockedFetches (reqs :: [BlockedFetch r])) =
       case stateGet (states env) of
         Nothing ->
-          return (SyncFetch (mapM_ (setError e) reqs))
-          where e req = DataSourceError $
-                  "data source not initialized: " <>
-                  dataSourceName req <>
+          return (SyncFetch (mapM_ (setError (const e)) reqs))
+         where
+           e = DataSourceError $ "data source not initialized: " <> dsName
                   ": " <>
                   Text.pack (showp req)
         Just state ->
           return $ wrapFetchInTrace i (length reqs)
                     (dataSourceName (undefined :: r a))
+                 $ (if (report f >= 2)
+                     then wrapFetchInStats sref dsName (length reqs)
+                     else id)
                  $ wrapFetchInCatch reqs
                  $ fetch state f (userEnv env) reqs
+      where
+        req :: r a; req = undefined; dsName = dataSourceName req
 
   fetches <- mapM applyFetch $ zip [n..] jobs
 
-  (waits, deepStats) <-
-    if report f >= 2
-    then do
-      (refs, timedfetches) <- mapAndUnzipM wrapFetchInStats fetches
-      waits <- scheduleFetches timedfetches
-      times <- mapM (fmap Just . readIORef) refs
-      return (waits, times)
-    else do
-      waits <- scheduleFetches fetches
-      return (waits, repeat Nothing)
+  waits <- scheduleFetches fetches
 
+{- TODO
   failures <-
-    {- if report f >= 3
+    if report f >= 3
     then
       forM jobs $ \(BlockedFetches reqs) ->
         fmap (Just . length) . flip filterM reqs $ \(BlockedFetch _ rvar) -> do
@@ -1153,26 +1149,11 @@ performFetches n env jobs = do
           return $ case mb of
             Just (Right _) -> False
             _ -> True
-    else -} return $ repeat Nothing
+    else return $ repeat Nothing
+-}
 
-  let dsroundstats = HashMap.fromList
-         [ (name, DataSourceRoundStats { dataSourceFetches = dsfetch
-                                       , dataSourceTime = fst <$> dsStats
-                                       , dataSourceAllocation = snd <$> dsStats
-                                       , dataSourceFailures = dsfailure
-                                       })
-         | ((name, dsfetch), dsStats, dsfailure) <-
-             zip3 roundstats deepStats failures]
-
-  a1 <- getAllocationCounter
   t1 <- getCurrentTime
-  let
-    roundtime = realToFrac (diffUTCTime t1 t0) :: Double
-    allocation = fromIntegral $ a0 - a1
-
-  ifReport f 1 $
-    modifyIORef' sref $ \(Stats rounds) -> roundstats `deepseq`
-      Stats (RoundStats (microsecs roundtime) allocation dsroundstats: rounds)
+  let roundtime = realToFrac (diffUTCTime t1 t0) :: Double
 
   ifTrace f 1 $
     printf "Batch data fetch done (%.2fs)\n" (realToFrac roundtime :: Double)
@@ -1210,26 +1191,74 @@ wrapFetchInCatch reqs fetch =
     forceError e (BlockedFetch _ rvar) =
       putResult rvar (except e)
 
-wrapFetchInStats :: PerformFetch -> IO (IORef (Microseconds, Int), PerformFetch)
-wrapFetchInStats f = do
-  r <- newIORef (0, 0)
-  case f of
-    SyncFetch io -> return (r, SyncFetch (statsForIO io >>= writeIORef r))
+{-
+- can't wrap fetch, doesn't work for future fetch / fully async
+- have to wrap jobs, but now we can't do batches
+
+SyncFetch:
+  - easy
+  - can report time for batch
+AsyncFetch:
+  - start clock when we submit, stop clock when we have the result
+  - can report time for batch
+FutureFetch:
+  - start clock when we submit, stop clock when we have the result
+    (wrap the future we get back)
+  - can report time for batch
+FullyAsyncFetch:
+  - start clock when we submit
+  - putResultVar must report the fetch time
+  - cannot report time for the batch
+  - so we must modify the ResultVar
+-}
+
+
+wrapFetchInStats
+  :: IORef Stats
+  -> Text
+  -> Int
+  -> PerformFetch
+  -> PerformFetch
+
+wrapFetchInStats !statsRef dataSource batchSize perform = do
+  case perform of
+    SyncFetch io ->
+      SyncFetch $ do
+        (t,alloc,_) <- statsForIO io
+        updateFetchStats t alloc
     AsyncFetch f -> do
-       inner_r <- newIORef (0, 0)
-       return (r, AsyncFetch $ \inner -> do
-         (totalTime, totalAlloc) <-
-           statsForIO (f (statsForIO inner >>= writeIORef inner_r))
+       AsyncFetch $ \inner -> do
+         inner_r <- newIORef (0, 0)
+         let inner' = do
+               (t,alloc,_) <- statsForIO inner
+               writeIORef inner_r (t,alloc)
+         (totalTime, totalAlloc, _) <- statsForIO (f inner')
          (innerTime, innerAlloc) <- readIORef inner_r
-         writeIORef r (totalTime - innerTime, totalAlloc - innerAlloc))
-    FutureFetch io -> return (r, FutureFetch io) -- TODO
-    FullyAsyncFetch io -> return (r, FullyAsyncFetch io) -- TODO
+         updateFetchStats (totalTime - innerTime) (totalAlloc - innerAlloc)
+    FutureFetch submit ->
+       FutureFetch $ do
+         (submitTime, submitAlloc, wait) <- statsForIO submit
+         return $ do
+           (waitTime, waitAlloc, _) <- statsForIO wait
+           updateFetchStats (submitTime + waitTime) (submitAlloc + waitAlloc)
+    FullyAsyncFetch io ->
+       FullyAsyncFetch io
   where
     statsForIO io = do
       prevAlloc <- getAllocationCounter
-      t <- time io
+      (t,a) <- time io
       postAlloc <- getAllocationCounter
-      return (t, fromIntegral $ prevAlloc - postAlloc)
+      return (t, fromIntegral $ prevAlloc - postAlloc, a)
+
+    updateFetchStats :: Microseconds -> Int64 -> IO ()
+    updateFetchStats time space = do
+      let this = FetchStats { fetchDataSource = dataSource
+                            , fetchBatchSize = batchSize
+                            , fetchTime = time
+                            , fetchSpace = space
+                            , fetchFailures = 0 {- TODO -} }
+      atomicModifyIORef' statsRef $ \(Stats fs) -> (Stats (this : fs), ())
+
 
 wrapFetchInTrace :: Int -> Int -> Text.Text -> PerformFetch -> PerformFetch
 #ifdef EVENTLOG
@@ -1249,12 +1278,12 @@ wrapFetchInTrace i n dsName f =
 wrapFetchInTrace _ _ _ f = f
 #endif
 
-time :: IO () -> IO Microseconds
+time :: IO a -> IO (Microseconds,a)
 time io = do
   t0 <- getCurrentTime
-  io
+  a <- io
   t1 <- getCurrentTime
-  return (microsecs (realToFrac (t1 `diffUTCTime` t0)))
+  return (microsecs (realToFrac (t1 `diffUTCTime` t0)), a)
 
 microsecs :: Double -> Microseconds
 microsecs t = round (t * 10^(6::Int))

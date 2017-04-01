@@ -35,19 +35,17 @@ module Haxl.Core.Types (
 
   -- * Statistics
   Stats(..),
-  RoundStats(..),
-  DataSourceRoundStats(..),
+  FetchStats(..),
   Microseconds,
-  Round,
   emptyStats,
   numRounds,
   numFetches,
   ppStats,
-  ppRoundStats,
-  ppDataSourceRoundStats,
+  ppFetchStats,
   Profile,
   emptyProfile,
   profile,
+  Round,
   profileRound,
   profileCache,
   ProfileLabel,
@@ -93,19 +91,20 @@ import Control.Applicative
 import Control.Exception
 import Control.Monad
 import Data.Aeson
-import Data.Function (on)
 import Data.Functor.Constant
 import Data.Int
 import Data.Hashable
-import Data.HashMap.Strict (HashMap, toList)
+import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
-import Data.List (intercalate, sortBy)
+import Data.List (intercalate)
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Text (Text, unpack)
+import Data.Text (Text)
+import qualified Data.Text as Text
 import Data.Typeable.Internal
+import Text.Printf
 
 #if __GLASGOW_HASKELL__ < 708
 import Haxl.Core.Util (tryReadMVar)
@@ -121,8 +120,13 @@ data Flags = Flags
   { trace :: {-# UNPACK #-} !Int
     -- ^ Tracing level (0 = quiet, 3 = very verbose).
   , report :: {-# UNPACK #-} !Int
-    -- ^ Report level (0 = quiet, 1 = # of requests, 2 = time, 3 = # of errors,
-    -- 4 = profiling, 5 = log stack traces of dataFetch calls)
+    -- ^ Report level:
+    --    * 0 = quiet
+    --    * 1 = quiet (legacy, this used to do something)
+    --    * 2 = data fetch stats
+    --    * 3 = # of errors
+    --    * 4 = profiling
+    --    * 5 = log stack traces of dataFetch calls
   , caching :: {-# UNPACK #-} !Int
     -- ^ Non-zero if caching is enabled.  If caching is disabled, then
     -- we still do batching and de-duplication within a round, but do
@@ -132,7 +136,7 @@ data Flags = Flags
 defaultFlags :: Flags
 defaultFlags = Flags
   { trace = 0
-  , report = 1
+  , report = 0
   , caching = 1
   }
 
@@ -159,33 +163,34 @@ ifProfiling flags = when (report flags >= 4) . void
 -- Stats
 
 type Microseconds = Int
--- | Rounds are 1-indexed
-type Round = Int
 
 -- | Stats that we collect along the way.
-newtype Stats = Stats [RoundStats]
+newtype Stats = Stats [FetchStats]
   deriving (Show, ToJSON)
 
 -- | Pretty-print Stats.
 ppStats :: Stats -> String
 ppStats (Stats rss) =
   intercalate "\n"
-     [ "Round: " ++ show i ++ " - " ++ ppRoundStats rs
-     | (i, rs) <- zip [(1::Int)..] (filter isRoundStats (reverse rss)) ]
+     [ "Fetch: " ++ show i ++ " - " ++ ppFetchStats rs
+     | (i, rs) <- zip [(1::Int)..] (filter isFetchStats (reverse rss)) ]
  where
-  isRoundStats RoundStats{} = True
-  isRoundStats _ = False
+  isFetchStats FetchStats{} = True
+  isFetchStats _ = False
 
 -- | Maps data source name to the number of requests made in that round.
 -- The map only contains entries for sources that made requests in that
 -- round.
-data RoundStats
-    -- | Timing stats for a round of data fetching
-  = RoundStats
-    { roundTime :: Microseconds
-    , roundAllocation :: Int
-    , roundDataSources :: HashMap Text DataSourceRoundStats
+data FetchStats
+    -- | Timing stats for a (batched) data fetch
+  = FetchStats
+    { fetchDataSource :: Text
+    , fetchBatchSize :: {-# UNPACK #-} !Int
+    , fetchTime :: {-# UNPACK #-} !Microseconds
+    , fetchSpace :: {-# UNPACK #-} !Int64
+    , fetchFailures :: {-# UNPACK #-} !Int
     }
+
     -- | The stack trace of a call to 'dataFetch'.  These are collected
     -- only when profiling and reportLevel is 5 or greater.
   | FetchCall
@@ -195,61 +200,34 @@ data RoundStats
   deriving (Show)
 
 -- | Pretty-print RoundStats.
-ppRoundStats :: RoundStats -> String
-ppRoundStats (RoundStats t a dss) =
-    show t ++ "us " ++ show a ++ " bytes\n"
-      ++ unlines [ "  " ++ unpack nm ++ ": " ++ ppDataSourceRoundStats dsrs
-                 | (nm, dsrs) <- sortBy (compare `on` fst) (toList dss) ]
-ppRoundStats (FetchCall r ss) = show r ++ '\n':show ss
+ppFetchStats :: FetchStats -> String
+ppFetchStats FetchStats{..} =
+  printf "%s: %d fetches (%.2fus, %d bytes, %d failures)"
+    (Text.unpack fetchDataSource) fetchBatchSize
+    (fromIntegral fetchTime / 1000000 :: Double)  fetchSpace fetchFailures
+ppFetchStats (FetchCall r ss) = show r ++ '\n':show ss
 
-instance ToJSON RoundStats where
-  toJSON RoundStats{..} = object
-    [ "time" .= roundTime
-    , "allocation" .= roundAllocation
-    , "dataSources" .= roundDataSources
+instance ToJSON FetchStats where
+  toJSON FetchStats{..} = object
+    [ "datasource" .= fetchDataSource
+    , "fetches" .= fetchBatchSize
+    , "time" .= fetchTime
+    , "allocation" .= fetchSpace
+    , "failures" .= fetchFailures
     ]
   toJSON (FetchCall req strs) = object
     [ "request" .= req
     , "stack" .= strs
     ]
 
--- | Detailed stats of each data source in each round.
-data DataSourceRoundStats = DataSourceRoundStats
-  { dataSourceFetches :: Int
-  , dataSourceTime :: Maybe Microseconds
-  , dataSourceFailures :: Maybe Int
-  , dataSourceAllocation :: Maybe Int
-  } deriving (Show)
-
--- | Pretty-print DataSourceRoundStats
-ppDataSourceRoundStats :: DataSourceRoundStats -> String
-ppDataSourceRoundStats (DataSourceRoundStats fetches time failures allocs) =
-  maybe id (\t s -> s ++ " (" ++ show t ++ "us)") time $
-  maybe id (\a s -> s ++ " (" ++ show a ++ " bytes)") allocs $
-  maybe id (\f s -> s ++ " " ++ show f ++ " failures") failures $
-  show fetches ++ " fetches"
-
-instance ToJSON DataSourceRoundStats where
-  toJSON DataSourceRoundStats{..} = object [k .= v | (k, Just v) <-
-    [ ("fetches", Just dataSourceFetches)
-    , ("time", dataSourceTime)
-    , ("failures", dataSourceFailures)
-    , ("allocation", dataSourceAllocation)
-    ]]
-
-fetchesInRound :: RoundStats -> Int
-fetchesInRound (RoundStats _ _ hm) =
-  sum $ map dataSourceFetches $ HashMap.elems hm
-fetchesInRound _ = 0
-
 emptyStats :: Stats
 emptyStats = Stats []
 
 numRounds :: Stats -> Int
-numRounds (Stats rs) = length [ s | s@RoundStats{} <- rs ]
+numRounds (Stats rs) = length rs        -- not really
 
 numFetches :: Stats -> Int
-numFetches (Stats rs) = sum (map fetchesInRound rs)
+numFetches (Stats rs) = sum [ fetchBatchSize | FetchStats{..} <- rs ]
 
 
 -- ---------------------------------------------------------------------------
@@ -259,12 +237,14 @@ type ProfileLabel = Text
 type AllocCount = Int64
 type MemoHitCount = Int64
 
+type Round = Int
+
 data Profile = Profile
   { profileRound :: {-# UNPACK #-} !Round
      -- ^ Keep track of what the current fetch round is.
   , profile      :: HashMap ProfileLabel ProfileData
      -- ^ Data on individual labels.
-  , profileCache :: DataCache (Constant Round)
+  , profileCache :: DataCache (Constant Int)
      -- ^ Keep track of the round requests first appear in.
   }
 

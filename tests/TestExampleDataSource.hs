@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP, OverloadedStrings, RebindableSyntax, MultiWayIf #-}
+{-# LANGUAGE RecordWildCards #-}
 module TestExampleDataSource (tests) where
 
 import Haxl.Prelude as Haxl
@@ -7,7 +8,6 @@ import Prelude()
 import Haxl.Core.Monad (unsafeLiftIO)
 import Haxl.Core
 
-import qualified Data.HashMap.Strict as HashMap
 import Test.HUnit
 import Data.IORef
 import Control.Exception
@@ -24,7 +24,8 @@ testEnv = do
   let st = stateSet exstate stateEmpty
 
   -- Create the Env:
-  initEnv st ()
+  env <- initEnv st ()
+  return env{ flags = (flags env){ report = 2 } }
 
 
 tests = TestList [
@@ -51,14 +52,15 @@ exampleTest = TestCase $ do
 
   -- Should be just one fetching round:
   Stats stats <- readIORef (statsRef env)
+  putStrLn (ppStats (Stats stats))
   assertEqual "rounds" 1 (length stats)
 
   -- With two fetches:
   assertBool "reqs" $
-      if | RoundStats { roundDataSources = m } : _  <- stats,
-           Just (DataSourceRoundStats { dataSourceFetches = 2 })
-              <- HashMap.lookup "ExampleDataSource" m  -> True
-         | otherwise -> False
+    case stats of
+       [FetchStats{..}] ->
+         fetchDataSource == "ExampleDataSource" && fetchBatchSize == 2
+       _otherwise -> False
 
 -- Test side-effect ordering
 
