@@ -48,7 +48,7 @@ instance DataSourceName SleepReq where
   dataSourceName _ = "SleepDataSource"
 
 instance DataSource u SleepReq where
-  fetch  _state _flags _user bfs = FullyAsyncFetch $ mapM_ fetch1 bfs
+  fetch  _state _flags _user = BackgroundFetch $ mapM_ fetch1
   schedulerHint _ = SubmitImmediately
 
 initGlobalState :: IO (State SleepReq)

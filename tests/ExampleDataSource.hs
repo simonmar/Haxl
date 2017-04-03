@@ -117,10 +117,9 @@ initGlobalState = do
 exampleFetch :: State ExampleReq             -- current state
              -> Flags                        -- tracing verbosity, etc.
              -> u                            -- user environment
-             -> [BlockedFetch ExampleReq]    -- requests to fetch
-             -> PerformFetch                 -- tells the framework how to fetch
+             -> PerformFetch ExampleReq      -- tells the framework how to fetch
 
-exampleFetch _state _flags _user bfs = SyncFetch $ mapM_ fetch1 bfs
+exampleFetch _state _flags _user = SyncFetch $ mapM_ fetch1
 
   -- There are two ways a data source can fetch data: synchronously or
   -- asynchronously.  See the type 'PerformFetch' in "Haxl.Core.Types" for

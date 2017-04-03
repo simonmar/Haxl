@@ -50,9 +50,9 @@ instance DataSourceName TAOReq where
   dataSourceName _ = "MockTAO"
 
 instance DataSource UserEnv TAOReq where
-  fetch TAOState{..} _flags _user bfs
-    | future = FutureFetch $ return (mapM_ doFetch bfs)
-    | otherwise = SyncFetch $ mapM_ doFetch  bfs
+  fetch TAOState{..} _flags _user
+    | future = FutureFetch $ return . mapM_ doFetch
+    | otherwise = SyncFetch $ mapM_ doFetch
 
 initGlobalState :: Bool -> IO (State TAOReq)
 initGlobalState future = return TAOState { future=future }

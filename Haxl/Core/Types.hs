@@ -317,9 +317,7 @@ class (DataSourceName req, StateKey req, ShowP req) => DataSource u req where
       -- ^ Tracing flags.
     -> u
       -- ^ User environment.
-    -> [BlockedFetch req]
-      -- ^ Requests to fetch.
-    -> PerformFetch
+    -> PerformFetch req
       -- ^ Fetch the data; see 'PerformFetch'.
 
   schedulerHint :: u -> SchedulerHint req
@@ -353,24 +351,24 @@ data SchedulerHint (req :: * -> *)
   | SubmitImmediately
     -- ^ Submit a request via fetch as soon as we have one, don't try to
     -- batch multiple requests.  This is really only useful if the data source
-    -- returns FullyAsyncFetch, otherwise requests to this data source will
+    -- returns BackgroundFetch, otherwise requests to this data source will
     -- be performed synchronously, one at a time.
 
 -- | A data source can fetch data in one of four ways.
 --
-data PerformFetch
-  = SyncFetch  (IO ())
+data PerformFetch req
+  = SyncFetch  ([BlockedFetch req] -> IO ())
     -- ^ Fully synchronous, returns only when all the data is fetched.
     -- See 'syncFetch' for an example.
-  | AsyncFetch (IO () -> IO ())
+  | AsyncFetch ([BlockedFetch req] -> IO () -> IO ())
     -- ^ Asynchronous; performs an arbitrary IO action while the data
     -- is being fetched, but only returns when all the data is
     -- fetched.  See 'asyncFetch' for an example.
-  | FullyAsyncFetch (IO ())
+  | BackgroundFetch ([BlockedFetch req] -> IO ())
     -- ^ Fetches the data in the background, calling 'putResult' at
     -- any time in the future.  This is the best kind of fetch,
     -- because it provides the most concurrency.
-  | FutureFetch (IO (IO ()))
+  | FutureFetch ([BlockedFetch req] -> IO (IO ()))
     -- ^ Returns an IO action that, when performed, waits for the data
     -- to be received.  This is the second-best type of fetch, because
     -- the scheduler still has to perform the blocking wait at some
@@ -378,7 +376,7 @@ data PerformFetch
     -- perform, it can't know which one will return first.
     --
     -- Why not just forkIO the IO action to make a FutureFetch into a
-    -- FullyAsyncFetch?  The blocking wait will probably do a safe FFI
+    -- BackgroundFetch?  The blocking wait will probably do a safe FFI
     -- call, which means it needs its own OS thread.  If we don't want
     -- to create an arbitrary number of OS threads, then FutureFetch
     -- enables all the blocking waits to be done on a single thread.
@@ -437,8 +435,8 @@ except = Left . toException
 
 stubFetch
   :: (Exception e) => (forall a. r a -> e)
-  -> State r -> Flags -> u -> [BlockedFetch r] -> PerformFetch
-stubFetch e _state _flags _si bfs = SyncFetch $ mapM_ (setError e) bfs
+  -> State r -> Flags -> u -> PerformFetch r
+stubFetch e _state _flags _si = SyncFetch $ mapM_ (setError e)
 
 -- | Common implementation templates for 'fetch' of 'DataSource'.
 --
@@ -471,10 +469,7 @@ asyncFetchWithDispatch
   -> u
   -- ^ Currently unused.
 
-  -> [BlockedFetch request]
-  -- ^ Requests to submit.
-
-  -> PerformFetch
+  -> PerformFetch request
 
 asyncFetch, syncFetch
   :: ((service -> IO ()) -> IO ())
@@ -495,29 +490,26 @@ asyncFetch, syncFetch
   -> u
   -- ^ Currently unused.
 
-  -> [BlockedFetch request]
-  -- ^ Requests to submit.
-
-  -> PerformFetch
+  -> PerformFetch request
 
 asyncFetchWithDispatch
-  withService dispatch wait enqueue _state _flags _si requests =
-  AsyncFetch $ \inner -> withService $ \service -> do
+  withService dispatch wait enqueue _state _flags _si =
+  AsyncFetch $ \requests inner -> withService $ \service -> do
     getResults <- mapM (submitFetch service enqueue) requests
     dispatch service
     inner
     wait service
     sequence_ getResults
 
-asyncFetch withService wait enqueue _state _flags _si requests =
-  AsyncFetch $ \inner -> withService $ \service -> do
+asyncFetch withService wait enqueue _state _flags _si =
+  AsyncFetch $ \requests inner -> withService $ \service -> do
     getResults <- mapM (submitFetch service enqueue) requests
     inner
     wait service
     sequence_ getResults
 
-syncFetch withService dispatch enqueue _state _flags _si requests =
-  SyncFetch . withService $ \service -> do
+syncFetch withService dispatch enqueue _state _flags _si =
+  SyncFetch $ \requests -> withService $ \service -> do
   getResults <- mapM (submitFetch service enqueue) requests
   dispatch service
   sequence_ getResults

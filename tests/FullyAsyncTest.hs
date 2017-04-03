@@ -15,7 +15,8 @@ tests = sleepTest
 
 testEnv = do
   st <- SleepDataSource.initGlobalState
-  initEnv (stateSet st stateEmpty) ()
+  env <- initEnv (stateSet st stateEmpty) ()
+  return env { flags = (flags env) { report = 2 } }
 
 sleepTest :: Test
 sleepTest = TestCase $ do
@@ -26,8 +27,8 @@ sleepTest = TestCase $ do
 
   -- simulate running a selection of data fetches that complete at
   -- different times, overlapping them as much as possible.
-  x <- runHaxl env $
-    sequence
+  runHaxl env $
+    sequence_
        [ sequence_ [sleep 100, sleep 400] `andThen` tick 5     -- A
        , sleep 100 `andThen` tick 2 `andThen` sleep 200 `andThen` tick 4    -- B
        , sleep 50 `andThen` tick 1 `andThen` sleep 150 `andThen` tick 3     -- C
@@ -35,6 +36,10 @@ sleepTest = TestCase $ do
 
   ys <- readIORef ref
   assertEqual "FullyAsyncTest: ordering" [1,2,3,4,5] (reverse ys)
+
+  stats <- readIORef (statsRef env)
+  print stats
+  assertEqual "FullyAsyncTest: stats" 5 (numFetches stats)
 
 andThen :: GenHaxl u a -> GenHaxl u b -> GenHaxl u b
 andThen a b = a >>= \_ -> b

@@ -7,7 +7,7 @@
 
 {- TODO
 
-- fetch stats for FullyAsyncFetch
+- fetch stats for BackgroundFetch
 - fetch failure stats
 - do EVENTLOG stuff, track the data fetch numbers for performFetch
 
@@ -29,6 +29,7 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TupleSections #-}
 #if __GLASGOW_HASKELL >= 800
 {-# OPTIONS_GHC -Wno-name-shadowing #-}
 #else
@@ -1160,26 +1161,30 @@ performFetches n env@Env{flags=f, statsRef=sref} jobs = do
       forM_ reqs $ \(BlockedFetch r _) -> putStrLn (showp r)
 
   let
-    applyFetch (i, BlockedFetches (reqs :: [BlockedFetch r])) =
+    applyFetch i (BlockedFetches (reqs :: [BlockedFetch r])) =
       case stateGet (states env) of
         Nothing ->
-          return (SyncFetch (mapM_ (setError (const e)) reqs))
+          return (FetchToDo reqs (SyncFetch (mapM_ (setError (const e)))))
          where
            e = DataSourceError $ "data source not initialized: " <> dsName
                   ": " <>
                   Text.pack (showp req)
         Just state ->
-          return $ wrapFetchInTrace i (length reqs)
-                    (dataSourceName (undefined :: r a))
-                 $ (if (report f >= 2)
-                     then wrapFetchInStats sref dsName (length reqs)
-                     else id)
-                 $ wrapFetchInCatch reqs
-                 $ fetch state f (userEnv env) reqs
+          return
+            $ FetchToDo reqs
+            $ (if report f >= 2
+                then wrapFetchInStats sref dsName (length reqs)
+                else id)
+            $ wrapFetchInTrace i (length reqs)
+               (dataSourceName (undefined :: r a))
+            $ wrapFetchInCatch reqs
+            $ fetch state f (userEnv env))
+
+
       where
         req :: r a; req = undefined; dsName = dataSourceName req
 
-  fetches <- mapM applyFetch $ zip [n..] jobs
+  fetches <- zipWithM applyFetch [n..] jobs
 
   waits <- scheduleFetches fetches
 
@@ -1207,23 +1212,26 @@ performFetches n env@Env{flags=f, statsRef=sref} jobs = do
 
   return (n', waits)
 
+data FetchToDo where
+  FetchToDo :: [BlockedFetch req] -> PerformFetch req -> FetchToDo
+
 -- Catch exceptions arising from the data source and stuff them into
 -- the appropriate requests.  We don't want any exceptions propagating
 -- directly from the data sources, because we want the exception to be
 -- thrown by dataFetch instead.
 --
-wrapFetchInCatch :: [BlockedFetch req] -> PerformFetch -> PerformFetch
+wrapFetchInCatch :: [BlockedFetch req] -> PerformFetch req -> PerformFetch req
 wrapFetchInCatch reqs fetch =
   case fetch of
-    SyncFetch io ->
-      SyncFetch (io `Exception.catch` handler)
-    AsyncFetch fio ->
-      AsyncFetch (\io -> fio io `Exception.catch` handler)
-    FutureFetch io ->
-      FutureFetch (io `Exception.catch` (
-                     \e -> handler e >> return (return ())))
-    FullyAsyncFetch io ->
-      FullyAsyncFetch (io `Exception.catch` handler)
+    SyncFetch f ->
+      SyncFetch $ \reqs -> f reqs `Exception.catch` handler
+    AsyncFetch f ->
+      AsyncFetch $ \reqs io -> f reqs io `Exception.catch` handler
+    FutureFetch f ->
+      FutureFetch $ \reqs -> f reqs `Exception.catch` (
+                     \e -> handler e >> return (return ()))
+    BackgroundFetch f ->
+      BackgroundFetch $ \reqs -> f reqs `Exception.catch` handler
   where
     handler :: SomeException -> IO ()
     handler e = do
@@ -1240,40 +1248,47 @@ wrapFetchInStats
   :: IORef Stats
   -> Text
   -> Int
-  -> PerformFetch
-  -> PerformFetch
+  -> PerformFetch req
+  -> PerformFetch req
 
 wrapFetchInStats !statsRef dataSource batchSize perform = do
   case perform of
-    SyncFetch io ->
-      SyncFetch $ do
-        (t,alloc,_) <- statsForIO io
+    SyncFetch f ->
+      SyncFetch $ \reqs -> do
+        (t,alloc,_) <- statsForIO (f reqs)
         updateFetchStats t alloc
     AsyncFetch f -> do
-       AsyncFetch $ \inner -> do
+      AsyncFetch $ \reqs inner -> do
          inner_r <- newIORef (0, 0)
          let inner' = do
                (t,alloc,_) <- statsForIO inner
                writeIORef inner_r (t,alloc)
-         (totalTime, totalAlloc, _) <- statsForIO (f inner')
+         (totalTime, totalAlloc, _) <- statsForIO (f reqs inner')
          (innerTime, innerAlloc) <- readIORef inner_r
          updateFetchStats (totalTime - innerTime) (totalAlloc - innerAlloc)
     FutureFetch submit ->
-       FutureFetch $ do
-         (submitTime, submitAlloc, wait) <- statsForIO submit
+      FutureFetch $ \reqs -> do
+         (submitTime, submitAlloc, wait) <- statsForIO (submit reqs)
          return $ do
            (waitTime, waitAlloc, _) <- statsForIO wait
            updateFetchStats (submitTime + waitTime) (submitAlloc + waitAlloc)
-    FullyAsyncFetch io ->
-       FullyAsyncFetch io
-          -- TODO: we will have to wrap the ResultVars, but we need to know
-          -- beforehand that this datasource will return a FullyAsyncFetch
+    BackgroundFetch io -> do
+      BackgroundFetch $ \reqs -> do
+        startTimeRef <- newIORef =<< getCurrentTime
+        io (map (addTimer startTimeRef) reqs)
   where
     statsForIO io = do
       prevAlloc <- getAllocationCounter
       (t,a) <- time io
       postAlloc <- getAllocationCounter
       return (t, fromIntegral $ prevAlloc - postAlloc, a)
+
+    addTimer startTimeRef (BlockedFetch req (ResultVar fn)) =
+      BlockedFetch req $ ResultVar $ \result -> do
+        t0 <- readIORef startTimeRef
+        t1 <- getCurrentTime
+        updateFetchStats (microsecs (realToFrac (t1 `diffUTCTime` t0))) 0
+        fn result
 
     updateFetchStats :: Microseconds -> Int64 -> IO ()
     updateFetchStats time space = do
@@ -1285,7 +1300,12 @@ wrapFetchInStats !statsRef dataSource batchSize perform = do
       atomicModifyIORef' statsRef $ \(Stats fs) -> (Stats (this : fs), ())
 
 
-wrapFetchInTrace :: Int -> Int -> Text.Text -> PerformFetch -> PerformFetch
+wrapFetchInTrace
+  :: Int
+  -> Int
+  -> Text.Text
+  -> PerformFetch req
+  -> PerformFetch req
 #ifdef EVENTLOG
 wrapFetchInTrace i n dsName f =
   case f of
@@ -1315,7 +1335,7 @@ microsecs t = round (t * 10^(6::Int))
 
 -- | Start all the async fetches first, then perform the sync fetches before
 -- getting the results of the async fetches.
-scheduleFetches :: [PerformFetch] -> IO [IO ()]
+scheduleFetches :: [FetchToDo] -> IO [IO ()]
 scheduleFetches fetches = do
   fully_async_fetches
   waits <- future_fetches
@@ -1323,16 +1343,17 @@ scheduleFetches fetches = do
   return waits
  where
   fully_async_fetches :: IO ()
-  fully_async_fetches = sequence_ [f | FullyAsyncFetch f <- fetches]
+  fully_async_fetches =
+    sequence_ [f reqs | FetchToDo reqs (BackgroundFetch f) <- fetches]
 
   future_fetches :: IO [IO ()]
-  future_fetches = sequence [f | FutureFetch f <- fetches]
+  future_fetches = sequence [f reqs | FetchToDo reqs (FutureFetch f) <- fetches]
 
   async_fetches :: IO () -> IO ()
-  async_fetches = compose [f | AsyncFetch f <- fetches]
+  async_fetches = compose [f reqs | FetchToDo reqs (AsyncFetch f) <- fetches]
 
   sync_fetches :: IO ()
-  sync_fetches = sequence_ [io | SyncFetch io <- fetches]
+  sync_fetches = sequence_ [f reqs | FetchToDo reqs (SyncFetch f) <- fetches]
 
 
 -- -----------------------------------------------------------------------------
