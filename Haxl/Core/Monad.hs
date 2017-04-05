@@ -97,7 +97,6 @@ import qualified Control.Exception as Exception
 #if __GLASGOW_HASKELL__ < 710
 import Control.Applicative hiding (Const)
 #endif
-import Control.DeepSeq
 import GHC.Exts (IsString(..), Addr#)
 #if __GLASGOW_HASKELL__ < 706
 import Prelude hiding (catch)
@@ -1167,8 +1166,8 @@ performFetches n env@Env{flags=f, statsRef=sref} jobs = do
           return (FetchToDo reqs (SyncFetch (mapM_ (setError (const e)))))
          where
            e = DataSourceError $ "data source not initialized: " <> dsName
-                  ": " <>
-                  Text.pack (showp req)
+                  <> ": "
+                  <> Text.pack (showp req)
         Just state ->
           return
             $ FetchToDo reqs
@@ -1178,9 +1177,7 @@ performFetches n env@Env{flags=f, statsRef=sref} jobs = do
             $ wrapFetchInTrace i (length reqs)
                (dataSourceName (undefined :: r a))
             $ wrapFetchInCatch reqs
-            $ fetch state f (userEnv env))
-
-
+            $ fetch state f (userEnv env)
       where
         req :: r a; req = undefined; dsName = dataSourceName req
 
@@ -1633,14 +1630,14 @@ GenHaxl a `pOr` GenHaxl b = GenHaxl $ \env ref -> do
     Done True -> return (Done True)
     Done False -> b env ref
     Throw _ -> return ra
-    Blocked a' -> do
+    Blocked ia a' -> do
       rb <- b env ref
       case rb of
-        Done True -> return (Blocked (Cont (return True)))
+        Done True -> return (Blocked ia (Cont (return True)))
           -- Note [tricky pOr/pAnd]
         Done False -> return ra
-        Throw e -> return (Blocked (Cont (throw e)))
-        Blocked b' -> return (Blocked (Cont (toHaxl a' `pOr` toHaxl b')))
+        Throw e -> return (Blocked ia (Cont (throw e)))
+        Blocked _ b' -> return (Blocked ia (Cont (toHaxl a' `pOr` toHaxl b')))
 
 -- | Parallel version of '(.&&)'.  Both arguments are evaluated in
 -- parallel, and if either returns 'False' then the other is
@@ -1658,14 +1655,14 @@ GenHaxl a `pAnd` GenHaxl b = GenHaxl $ \env ref -> do
     Done False -> return (Done False)
     Done True -> b env ref
     Throw _ -> return ra
-    Blocked a' -> do
+    Blocked ia a' -> do
       rb <- b env ref
       case rb of
-        Done False -> return (Blocked (Cont (return False)))
+        Done False -> return (Blocked ia (Cont (return False)))
           -- Note [tricky pOr/pAnd]
         Done True -> return ra
         Throw _ -> return rb
-        Blocked b' -> return (Blocked (Cont (toHaxl a' `pAnd` toHaxl b')))
+        Blocked _ b' -> return (Blocked ia (Cont (toHaxl a' `pAnd` toHaxl b')))
 
 {-
 Note [tricky pOr/pAnd]

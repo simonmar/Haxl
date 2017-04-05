@@ -36,7 +36,7 @@ data SleepReq a where
 deriving instance Eq (SleepReq a)
 deriving instance Show (SleepReq a)
 
-instance Show1 SleepReq where show1 = show
+instance ShowP SleepReq where showp = show
 
 instance Hashable (SleepReq a) where
    hashWithSalt s (Sleep n) = hashWithSalt s n

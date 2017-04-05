@@ -18,7 +18,7 @@ import Test.HUnit
 
 allTests :: Test
 allTests = TestList
-  [ {- TestLabel "ExampleDataSource" TestExampleDataSource.tests
+  [ TestLabel "ExampleDataSource" TestExampleDataSource.tests
   , TestLabel "BatchTests" $ BatchTests.tests True
   , TestLabel "BatchTests" $ BatchTests.tests False
   , TestLabel "CoreTests" CoreTests.tests
@@ -30,5 +30,5 @@ allTests = TestList
   , TestLabel "ProfileTests" ProfileTests.tests
 #endif
   , TestLabel "MemoizationTests" MemoizationTests.tests
-  , -} TestLabel "FullyAsyncTest" FullyAsyncTest.tests
+  , TestLabel "FullyAsyncTest" FullyAsyncTest.tests
   ]
