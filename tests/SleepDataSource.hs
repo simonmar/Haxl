@@ -24,13 +24,14 @@ import Prelude ()
 import Haxl.Core
 import Haxl.DataSource.ConcurrentIO
 
-import Data.Hashable
 import Control.Concurrent
+import Data.Hashable
+import Data.Typeable
 
 sleep :: Int -> GenHaxl u Int
 sleep n = dataFetch (Sleep n)
 
-data Sleep
+data Sleep deriving Typeable
 instance ConcurrentIO Sleep where
   data ConcurrentIOReq Sleep a where
     Sleep :: Int -> ConcurrentIOReq Sleep Int

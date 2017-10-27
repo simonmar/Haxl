@@ -14,6 +14,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 
 -- |
 -- A generic Haxl datasource for performing arbitrary IO concurrently.
@@ -62,7 +63,9 @@ class ConcurrentIO tag where
   data ConcurrentIOReq tag a
   performIO :: ConcurrentIOReq tag a -> IO a
 
-instance Typeable tag => StateKey (ConcurrentIOReq tag) where
+deriving instance Typeable ConcurrentIOReq -- not needed by GHC 7.10 and later
+
+instance (Typeable tag) => StateKey (ConcurrentIOReq tag) where
   data State (ConcurrentIOReq tag) = ConcurrentIOState
   getStateType _ = typeRep (Proxy :: Proxy ConcurrentIOReq)
 
