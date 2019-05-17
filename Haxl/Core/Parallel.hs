@@ -36,26 +36,8 @@ infixr 4 `pOr`
 -- the other argument may have produced if it had been allowed to
 -- complete.
 pOr :: GenHaxl u w Bool -> GenHaxl u w Bool -> GenHaxl u w Bool
-GenHaxl a `pOr` GenHaxl b = GenHaxl $ \env@Env{..} -> do
-  let !senv = speculate env
-  ra <- a senv
-  case ra of
-    Done True -> return (Done True)
-    Done False -> b env  -- not speculative
-    Throw _ -> return ra
-    Blocked ia a' -> do
-      rb <- b senv
-      case rb of
-        Done True -> return rb
-        Done False -> return ra
-        Throw _ -> return rb
-        Blocked _ b' -> return (Blocked ia (Cont (toHaxl a' `pOr` toHaxl b')))
-          -- Note [pOr Blocked/Blocked]
-          -- This will only wake up when ia is filled, which
-          -- is whatever the left side was waiting for.  This is
-          -- suboptimal because the right side might wake up first,
-          -- but handling this non-determinism would involve a much
-          -- more complicated implementation here.
+pOr = (<||>)
+
 
 -- | Parallel version of '(.&&)'.  Both arguments are evaluated in
 -- parallel, and if either returns 'False' then the other is
@@ -67,18 +49,4 @@ GenHaxl a `pOr` GenHaxl b = GenHaxl $ \env@Env{..} -> do
 -- the other argument may have produced if it had been allowed to
 -- complete.
 pAnd :: GenHaxl u w Bool -> GenHaxl u w Bool -> GenHaxl u w Bool
-GenHaxl a `pAnd` GenHaxl b = GenHaxl $ \env@Env{..} -> do
-  let !senv = speculate env
-  ra <- a senv
-  case ra of
-    Done False -> return (Done False)
-    Done True -> b env
-    Throw _ -> return ra
-    Blocked ia a' -> do
-      rb <- b senv
-      case rb of
-        Done False -> return rb
-        Done True -> return ra
-        Throw _ -> return rb
-        Blocked _ b' -> return (Blocked ia (Cont (toHaxl a' `pAnd` toHaxl b')))
-         -- See Note [pOr Blocked/Blocked]
+pAnd = (<&&>)

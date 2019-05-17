@@ -229,6 +229,28 @@ pOrTests future = do
       Left (NotFound _) -> True
       _ -> False
 
+  env <- makeTestEnv future
+  let myFriend x = (19 `elem`) <$> friendsOf x
+  r <- runHaxl env $ try $ (myFriend 3 .|| myFriend 4) `pOr` (myFriend 1)
+  assertBool "pOr6" $
+    case (r :: Either NotFound Bool) of
+      Right True -> True
+      _other -> False
+
+  env <- makeTestEnv future
+  let myFriend x = (10 `elem`) <$> friendsOf x
+  r <- runHaxl env $ try $ (myFriend 1) `pOr` (myFriend 2)
+  assertBool "pOr7" $
+    case (r :: Either NotFound Bool) of
+      Right True -> True
+      _other -> False
+  r <- runHaxl env $ try $ (myFriend 3)
+    -- this will cause the "double put" from the above pOr to happen
+  assertBool "pOr8" $
+    case (r :: Either NotFound Bool) of
+      Right True -> True
+      _other -> False
+
 pAndTests future = do
   env <- makeTestEnv future
 
@@ -277,6 +299,28 @@ pAndTests future = do
     case (r :: Either NotFound Bool) of
       Left (NotFound _) -> True
       _ -> False
+
+  env <- makeTestEnv future
+  let myFriend x = (19 `elem`) <$> friendsOf x
+  r <- runHaxl env $ try $ (myFriend 3 .|| myFriend 4) `pAnd` (myFriend 1)
+  assertBool "pAnd6" $
+    case (r :: Either NotFound Bool) of
+      Right False -> True
+      _other -> False
+
+  env <- makeTestEnv future
+  let myFriend x = (10 `notElem`) <$> friendsOf x
+  r <- runHaxl env $ try $ (myFriend 1) `pAnd` (myFriend 2)
+  assertBool "pAnd7" $
+    case (r :: Either NotFound Bool) of
+      Right False -> True
+      _other -> False
+  r <- runHaxl env $ try $ (myFriend 3)
+    -- this will cause the "double put" from the above pOr to happen
+  assertBool "pAnd8" $
+    case (r :: Either NotFound Bool) of
+      Right False -> True
+      _other -> False
 
 tests :: Bool -> Test
 tests future = TestList

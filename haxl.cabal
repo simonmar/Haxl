@@ -80,6 +80,7 @@ library
     Haxl.Core.Profile,
     Haxl.Core.Run,
     Haxl.Core.RequestStore,
+    Haxl.Core.Selective,
     Haxl.Core.ShowP,
     Haxl.Core.StateStore,
     Haxl.Core.Stats,

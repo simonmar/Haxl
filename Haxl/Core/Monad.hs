@@ -53,6 +53,15 @@ module Haxl.Core.Monad
   , Cont(..)
   , toHaxl
 
+    -- * Selective functors
+  , Selective (..)
+  , branch
+  , ifS
+  , selectA
+  , selectM
+  , (<||>)
+  , (<&&>)
+
     -- * IVar
   , IVar(..)
   , IVarContents(..)
@@ -110,6 +119,7 @@ module Haxl.Core.Monad
   ) where
 
 import Haxl.Core.Flags
+import Haxl.Core.Selective
 import Haxl.Core.Stats
 import Haxl.Core.StateStore
 import Haxl.Core.Exception
@@ -457,7 +467,7 @@ putIVar (IVar ref) a Env{..} = do
     IVarEmpty jobs -> do
       writeIORef ref (IVarFull a)
       modifyIORef' runQueueRef (appendJobList jobs)
-    IVarFull{} -> error "putIVar: multiple put"
+    IVarFull{} -> return () -- multi-put is used in biselect
 
 {-# INLINE addJob #-}
 addJob :: Env u w -> GenHaxl u w b -> IVar u w b -> IVar u w a -> IO ()
@@ -718,7 +728,7 @@ instance Applicative (GenHaxl u w) where
 --
 -- becomes
 --
---   (ff >>= putIVar i) <*> (a <- aa; f <- getIVar i; return (f a)
+--   (ff >>= putIVar i) <*> (do a <- aa; f <- getIVar i; return (f a))
 --
 -- where the IVar i is a new synchronisation point.  If the right side
 -- gets to the `getIVar` first, it will block until the left side has
@@ -726,11 +736,45 @@ instance Applicative (GenHaxl u w) where
 --
 -- We can also do it the other way around:
 --
---   (do ff <- f; getIVar i; return (ff a)) <*> (a >>= putIVar i)
+--   (do ff <- f; getIVar i; return (ff a)) <*> (aa >>= putIVar i)
 --
 -- The first was slightly faster according to tests/MonadBench.hs.
 
+instance Selective (GenHaxl u w) where
+  biselect (GenHaxl x) (GenHaxl y) = GenHaxl $ \env@Env{..} -> do
+    let !senv = speculate env
+    rx <- x env -- non speculative
+    case rx of
+      Done (Left  a) -> return (Done (Left a))
+      Done (Right b) -> unHaxl (fmap (b,) <$> GenHaxl y) env
+      Throw e -> return (Throw e)
 
+      Blocked ix x' -> do
+        ry <- y senv -- speculative
+        case ry of
+          Done (Left  a) -> return (Done (Left a))
+          Done (Right c) -> unHaxl (fmap (,c) <$> GenHaxl x) env
+          Throw e -> return (Throw e)
+          Blocked iy y' -> do
+            rvar <- newIVar
+            avar <- newIVar
+            bvar <- newIVar
+            addJob env (toHaxl x') avar ix
+            addJob env (toHaxl y') bvar iy
+            let
+              waita = do
+                l <- getIVar avar
+                case l of
+                  Left a -> return (Left a)
+                  Right b -> fmap (fmap (b,)) $ getIVar bvar
+              waitb = do
+                l <- getIVar bvar
+                case l of
+                  Left a -> return (Left a)
+                  Right b -> fmap (fmap (,b)) $ getIVar avar
+            addJob env waita rvar avar
+            addJob env waitb rvar bvar
+            return (Blocked rvar (Cont (getIVar rvar)))
 
 -- -----------------------------------------------------------------------------
 -- Env utils
