@@ -57,7 +57,7 @@ runHaxl env@Env{..} haxl = do
           result r = do
             e <- readIORef ref
             case e of
-              IVarFull _ -> error "multiple put"
+              IVarFull _ -> reschedule env rq -- multi-put is used by biselect
               IVarEmpty haxls -> do
                 writeIORef ref (IVarFull r)
                 -- Have we got the final result now?

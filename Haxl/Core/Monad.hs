@@ -361,7 +361,7 @@ putIVar (IVar ref) a Env{..} = do
     IVarEmpty jobs -> do
       writeIORef ref (IVarFull a)
       modifyIORef' runQueueRef (appendJobList jobs)
-    IVarFull{} -> error "putIVar: multiple put"
+    IVarFull{} -> return () -- multi-put is used in biselect
 
 {-# INLINE addJob #-}
 addJob :: Env u -> GenHaxl u b -> IVar u b -> IVar u a -> IO ()
@@ -647,13 +647,26 @@ instance Selective (GenHaxl u) where
           Done (Left  a) -> return (Done (Left a))
           Done (Right c) -> unHaxl (fmap (,c) <$> GenHaxl x) env
           Throw e -> return (Throw e)
-          Blocked _ y' -> return (Blocked ix (Cont (toHaxl x' `biselect` toHaxl y')))
-          -- Note [biselect Blocked/Blocked]
-          -- This will only wake up when ia is filled, which
-          -- is whatever the left side was waiting for.  This is
-          -- suboptimal because the right side might wake up first,
-          -- but handling this non-determinism would involve a much
-          -- more complicated implementation here.
+          Blocked iy y' -> do
+            rvar <- newIVar
+            avar <- newIVar
+            bvar <- newIVar
+            addJob env (toHaxl x') avar ix
+            addJob env (toHaxl y') bvar iy
+            let
+              waita = do
+                l <- getIVar avar
+                case l of
+                  Left a -> return (Left a)
+                  Right b -> fmap (fmap (b,)) $ getIVar bvar
+              waitb = do
+                l <- getIVar bvar
+                case l of
+                  Left a -> return (Left a)
+                  Right b -> fmap (fmap (,b)) $ getIVar avar
+            addJob env waita rvar avar
+            addJob env waitb rvar bvar
+            return (Blocked rvar (Cont (getIVar rvar)))
 
 -- -----------------------------------------------------------------------------
 -- Env utils
